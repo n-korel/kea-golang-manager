@@ -3,13 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
-	"flag"
 	"time"
 
+	"kea-golang-manager/internal/api"
 	"kea-golang-manager/internal/kea"
 	"kea-golang-manager/internal/service"
 	"kea-golang-manager/pkg/config"
@@ -20,6 +22,7 @@ func main() {
 	globalFS := flag.NewFlagSet("global", flag.ExitOnError)
 	keaURL := globalFS.String("kea-url", "http://localhost:8000", "Kea Control Agent URL")
 	timeout := globalFS.Duration("timeout", 10*time.Second, "HTTP request timeout")
+	httpAddr := globalFS.String("http-addr", ":8080", "HTTP server listen address")
 
 	if err := globalFS.Parse(os.Args[1:]); err != nil {
 		log.Fatalf("failed to parse global flags: %v", err)
@@ -41,6 +44,20 @@ func main() {
 	defer cancel()
 
 	switch command {
+	case "serve-http":
+		handler := api.NewHandler(dhcpService)
+		server := &http.Server{
+			Addr:         *httpAddr,
+			Handler:      handler,
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 10 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+
+		log.Printf("Starting HTTP server on %s", *httpAddr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server failed: %v", err)
+		}
 	case "add-subnet":
 		if err := handleAddSubnet(ctx, dhcpService, args[1:]); err != nil {
 			log.Fatalf("Error: %v", err)
@@ -122,7 +139,9 @@ func printUsage() {
 	fmt.Println("  kea-manager add-subnet -subnet=<CIDR> [-pools=<pool1,pool2>] [-hw-address=<mac>] [-ip-address=<ip>] [-hostname=<name>]")
 	fmt.Println("  kea-manager reload")
 	fmt.Println("  kea-manager show-config")
+	fmt.Println("  kea-manager serve-http [-http-addr=:8080]")
 	fmt.Println("\nFlags:")
 	fmt.Println("  -kea-url string    Kea Control Agent URL (default: http://localhost:8000)")
 	fmt.Println("  -timeout duration  HTTP request timeout (default: 10s)")
+	fmt.Println("  -http-addr string  HTTP server listen address (default: :8080)")
 }

@@ -1,62 +1,99 @@
 # Kea DHCP Manager
 
-Сервис на Go для управления Kea DHCP через REST API Control Agent.
+Go-сервис для управления [Kea DHCP](https://kea.readthedocs.io/) через REST API Control Agent. Поддерживает CLI и HTTP API.
+
+## Возможности
+
+- **CLI**: добавление подсетей, просмотр конфигурации, перезагрузка Kea
+- **HTTP API**: REST-эндпоинты для интеграции с другими сервисами
+- Работа с пулами адресов и резервациями (reservations)
+- Минимальные зависимости, стандартная библиотека + chi для роутинга
+
+## Требования
+
+- Go 1.21+
+- Kea DHCP с Control Agent (например, через Docker)
 
 ## Структура проекта
 
 ```
 kea-golang-manager/
-├── cmd/app/           # CLI приложение
+├── cmd/app/           # Точка входа: CLI и HTTP-сервер
 ├── internal/
-│   ├── kea/          # HTTP клиент для Kea Control Agent
-│   └── service/      # Бизнес-логика
-├── pkg/config/       # Конфигурация
-├── config/           # Конфигурационные файлы Kea
-├── docker-compose.yml
+│   ├── api/           # HTTP-обработчики (chi)
+│   ├── kea/           # Клиент Kea Control Agent
+│   └── service/       # Бизнес-логика (DHCPService)
+├── pkg/config/        # Конфигурация приложения
+├── config/            # Конфиги Kea (DHCP4, ctrl-agent)
+├── docker-compose.yml # Kea в контейнерах
 ├── Makefile
 └── README.md
 ```
 
 ## Быстрый старт
 
-### 1. Запуск Kea в Docker
+### 1. Запуск Kea
 
 ```bash
 docker compose up -d
 ```
 
-Проверка статуса:
+Проверка:
+
 ```bash
 docker compose ps
 docker compose logs kea-control-agent
 ```
 
-### 2. Сборка приложения
+Control Agent по умолчанию доступен на `http://localhost:8000`.
+
+### 2. Сборка
 
 ```bash
 make build
 ```
 
-Или напрямую:
+Или:
+
 ```bash
 go build -o bin/kea-manager cmd/app/main.go
 ```
 
-### 3. Использование CLI
+### 3. Режимы работы
 
-#### Показать текущую конфигурацию
+#### CLI
+
+| Команда | Описание |
+|--------|----------|
+| `show-config` | Вывести текущую конфигурацию Kea (JSON) |
+| `add-subnet` | Добавить подсеть с пулами и опциональными резервациями |
+| `reload` | Перезагрузить конфигурацию Kea |
+| `serve-http` | Запустить HTTP API-сервер |
+
+**Глобальные флаги** (до команды):
+
+- `-kea-url` — URL Kea Control Agent (по умолчанию `http://localhost:8000`)
+- `-timeout` — таймаут запросов (по умолчанию `10s`)
+- `-http-addr` — адрес HTTP-сервера для `serve-http` (по умолчанию `:8080`)
+
+#### Примеры CLI
+
+Показать конфигурацию:
+
 ```bash
 go run cmd/app/main.go show-config
 ```
 
-#### Добавить подсеть
+Добавить подсеть с пулами:
+
 ```bash
 go run cmd/app/main.go add-subnet \
   -subnet=192.168.1.0/24 \
   -pools=192.168.1.10-192.168.1.100,192.168.1.150-192.168.1.200
 ```
 
-#### Добавить подсеть с резервацией
+Добавить подсеть с резервацией:
+
 ```bash
 go run cmd/app/main.go add-subnet \
   -subnet=192.168.1.0/24 \
@@ -66,25 +103,75 @@ go run cmd/app/main.go add-subnet \
   -hostname=server1
 ```
 
-#### Перезагрузить конфигурацию
+Перезагрузить конфигурацию:
+
 ```bash
 go run cmd/app/main.go reload
 ```
 
-## Проверка через curl
+Запуск HTTP-сервера:
 
-### Получить конфигурацию
 ```bash
-curl -X POST http://localhost:8000 \
-  -H "Content-Type: application/json" \
-  -d '{
-    "command": "config-get",
-    "service": ["dhcp4"]
-  }'
+go run cmd/app/main.go serve-http -http-addr=:8080
 ```
 
-### Добавить подсеть
+---
+
+#### HTTP API (режим `serve-http`)
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| GET | `/config` | Получить конфигурацию Kea |
+| GET | `/subnets` | Список подсетей |
+| POST | `/subnets` | Добавить подсеть |
+| DELETE | `/subnets/{id}` | Удалить подсеть по индексу |
+| POST | `/reload` | Перезагрузить конфигурацию |
+
+**Добавление подсети** — `POST /subnets`:
+
+```json
+{
+  "subnet": "192.168.1.0/24",
+  "pools": ["192.168.1.10-192.168.1.100"],
+  "reservations": [
+    {
+      "hw_address": "aa:bb:cc:dd:ee:ff",
+      "ip_address": "192.168.1.50",
+      "hostname": "server1"
+    }
+  ]
+}
+```
+
+Примеры запросов:
+
 ```bash
+# Конфигурация
+curl -s http://localhost:8080/config | jq
+
+# Список подсетей
+curl -s http://localhost:8080/subnets | jq
+
+# Добавить подсеть
+curl -X POST http://localhost:8080/subnets \
+  -H "Content-Type: application/json" \
+  -d '{"subnet":"192.168.2.0/24","pools":["192.168.2.10-192.168.2.100"]}'
+
+# Перезагрузка
+curl -X POST http://localhost:8080/reload
+```
+
+## Прямые запросы к Kea Control Agent (curl)
+
+Для отладки можно вызывать Agent напрямую на порту 8000:
+
+```bash
+# Конфигурация
+curl -X POST http://localhost:8000 \
+  -H "Content-Type: application/json" \
+  -d '{"command":"config-get","service":["dhcp4"]}'
+
+# Добавить подсеть
 curl -X POST http://localhost:8000 \
   -H "Content-Type: application/json" \
   -d '{
@@ -93,82 +180,25 @@ curl -X POST http://localhost:8000 \
     "arguments": {
       "subnet4": {
         "subnet": "192.168.1.0/24",
-        "pools": [
-          {"pool": "192.168.1.10-192.168.1.100"}
-        ]
+        "pools": [{"pool": "192.168.1.10-192.168.1.100"}]
       }
     }
   }'
-```
 
-### Перезагрузить конфигурацию
-```bash
+# Перезагрузка
 curl -X POST http://localhost:8000 \
   -H "Content-Type: application/json" \
-  -d '{
-    "command": "config-reload",
-    "service": ["dhcp4"]
-  }'
+  -d '{"command":"config-reload","service":["dhcp4"]}'
 ```
 
 ## Архитектура
 
-### Слои
+- **internal/kea** — HTTP-клиент к Kea Control Agent: типизированные запросы/ответы, таймауты, обработка ошибок.
+- **internal/service** — бизнес-логика: валидация подсетей и пулов, преобразование моделей, вызовы клиента.
+- **internal/api** — HTTP-обработчики (chi): REST для конфигурации, подсетей и reload.
+- **cmd/app** — парсинг флагов, выбор команды (CLI или `serve-http`), вывод в консоль.
 
-1. **Client (internal/kea/)** - HTTP клиент для взаимодействия с Kea Control Agent
-   - Инкапсулирует REST API вызовы
-   - Типизированные структуры для запросов/ответов
-   - Обработка ошибок и таймаутов
-
-2. **Service (internal/service/)** - Бизнес-логика
-   - Валидация подсетей и пулов
-   - Конвертация моделей
-   - Оркестрация операций
-
-3. **CLI (cmd/app/)** - Командная строка
-   - Парсинг флагов
-   - Вызов сервисов
-   - Форматированный вывод
-
-### Принципы
-
-- **SOLID**: Разделение ответственности между слоями
-- **KISS**: Минимум зависимостей, стандартная библиотека Go
-- **Context-aware**: Все операции поддерживают context для отмены и таймаутов
-- **Error handling**: Явная обработка ошибок на всех уровнях
-
-## Пример вывода
-
-### show-config
-```json
-{
-  "Dhcp4": {
-    "interfaces-config": {
-      "interfaces": ["eth0"]
-    },
-    "subnet4": [
-      {
-        "subnet": "192.168.1.0/24",
-        "pools": [
-          {
-            "pool": "192.168.1.10-192.168.1.100"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-### add-subnet
-```
-Subnet 192.168.1.0/24 added successfully
-```
-
-### reload
-```
-Configuration reloaded successfully
-```
+Принципы: разделение слоёв (SOLID), минимум зависимостей (KISS), использование `context` для отмены и таймаутов, явная обработка ошибок.
 
 ## Остановка
 

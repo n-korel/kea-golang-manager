@@ -154,6 +154,109 @@ func (c *Client) Reload(ctx context.Context) error {
 	return nil
 }
 
+// ListSubnets возвращает список подсетей из текущей конфигурации.
+func (c *Client) ListSubnets(ctx context.Context) ([]Subnet4, error) {
+	cfg, err := c.GetConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	dhcp4, err := extractDhcp4Config(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	rawSubnets, ok := dhcp4["subnet4"].([]any)
+	if !ok || len(rawSubnets) == 0 {
+		return []Subnet4{}, nil
+	}
+
+	subnets := make([]Subnet4, 0, len(rawSubnets))
+	for _, s := range rawSubnets {
+		m, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		b, err := json.Marshal(m)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal subnet: %w", err)
+		}
+
+		var subnet Subnet4
+		if err := json.Unmarshal(b, &subnet); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal subnet: %w", err)
+		}
+
+		subnets = append(subnets, subnet)
+	}
+
+	return subnets, nil
+}
+
+// DeleteSubnet удаляет подсеть по её ID.
+func (c *Client) DeleteSubnet(ctx context.Context, id int) error {
+	cfg, err := c.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	dhcp4, err := extractDhcp4Config(cfg)
+	if err != nil {
+		return err
+	}
+
+	subnets, ok := dhcp4["subnet4"].([]any)
+	if !ok || len(subnets) == 0 {
+		return fmt.Errorf("subnet with id %d not found", id)
+	}
+
+	newSubnets := make([]any, 0, len(subnets))
+	found := false
+
+	for _, s := range subnets {
+		m, ok := s.(map[string]any)
+		if !ok {
+			newSubnets = append(newSubnets, s)
+			continue
+		}
+
+		rawID, ok := m["id"]
+		if !ok {
+			newSubnets = append(newSubnets, s)
+			continue
+		}
+
+		curID, ok := toInt(rawID)
+		if !ok {
+			newSubnets = append(newSubnets, s)
+			continue
+		}
+
+		if curID == id {
+			found = true
+			continue
+		}
+
+		newSubnets = append(newSubnets, s)
+	}
+
+	if !found {
+		return fmt.Errorf("subnet with id %d not found", id)
+	}
+
+	dhcp4["subnet4"] = newSubnets
+
+	if err := c.SetConfig(ctx, map[string]any{"Dhcp4": dhcp4}); err != nil {
+		return err
+	}
+	if err := c.writeConfig(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 const (
 	addSubnetMaxRetries     = 5
 	addSubnetInitialBackoff = 100 * time.Millisecond

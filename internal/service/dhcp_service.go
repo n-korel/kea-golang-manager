@@ -92,6 +92,11 @@ func (s *DHCPService) AddSubnet(ctx context.Context, subnet string, pools []stri
 	return s.client.AddSubnet(ctx, subnet4)
 }
 
+// ListSubnets возвращает список подсетей.
+func (s *DHCPService) ListSubnets(ctx context.Context) ([]kea.Subnet4, error) {
+	return s.client.ListSubnets(ctx)
+}
+
 // GetConfig получает текущую конфигурацию
 func (s *DHCPService) GetConfig(ctx context.Context) (map[string]interface{}, error) {
 	return s.client.GetConfig(ctx)
@@ -100,4 +105,9 @@ func (s *DHCPService) GetConfig(ctx context.Context) (map[string]interface{}, er
 // Reload перезагружает конфигурацию
 func (s *DHCPService) Reload(ctx context.Context) error {
 	return s.client.Reload(ctx)
+}
+
+// DeleteSubnet удаляет подсеть по ID.
+func (s *DHCPService) DeleteSubnet(ctx context.Context, id int) error {
+	return s.client.DeleteSubnet(ctx, id)
 }
