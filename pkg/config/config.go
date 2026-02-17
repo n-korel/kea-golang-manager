@@ -1,25 +1,17 @@
 package config
 
-import (
-	"flag"
-	"time"
-)
+import "time"
 
 // Config представляет конфигурацию приложения
 type Config struct {
-	KeaURL   string
-	Timeout  time.Duration
+	KeaURL  string
+	Timeout time.Duration
 }
 
-// Load загружает конфигурацию из флагов
-func Load() *Config {
-	cfg := &Config{}
-	
-	flag.StringVar(&cfg.KeaURL, "kea-url", "http://localhost:8000", "Kea Control Agent URL")
-	duration := flag.Duration("timeout", 10*time.Second, "HTTP request timeout")
-	
-	flag.Parse()
-	
-	cfg.Timeout = *duration
-	return cfg
+// New создает новую конфигурацию приложения
+func New(keaURL string, timeout time.Duration) *Config {
+	return &Config{
+		KeaURL:  keaURL,
+		Timeout: timeout,
+	}
 }

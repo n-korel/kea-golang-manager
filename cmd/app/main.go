@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"os"
 	"strings"
+	"flag"
+	"time"
 
 	"kea-golang-manager/internal/kea"
 	"kea-golang-manager/internal/service"
@@ -15,23 +16,33 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
+	// Глобальные флаги (общие для всех команд)
+	globalFS := flag.NewFlagSet("global", flag.ExitOnError)
+	keaURL := globalFS.String("kea-url", "http://localhost:8000", "Kea Control Agent URL")
+	timeout := globalFS.Duration("timeout", 10*time.Second, "HTTP request timeout")
+
+	if err := globalFS.Parse(os.Args[1:]); err != nil {
+		log.Fatalf("failed to parse global flags: %v", err)
+	}
+
+	args := globalFS.Args()
+	if len(args) < 1 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	cfg := config.Load()
+	command := args[0]
+
+	cfg := config.New(*keaURL, *timeout)
 	client := kea.NewClient(cfg.KeaURL, cfg.Timeout)
 	dhcpService := service.NewDHCPService(client)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()
 
-	command := os.Args[1]
-
 	switch command {
 	case "add-subnet":
-		if err := handleAddSubnet(ctx, dhcpService, os.Args[2:]); err != nil {
+		if err := handleAddSubnet(ctx, dhcpService, args[1:]); err != nil {
 			log.Fatalf("Error: %v", err)
 		}
 	case "reload":

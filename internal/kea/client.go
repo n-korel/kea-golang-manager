@@ -154,24 +154,92 @@ func (c *Client) Reload(ctx context.Context) error {
 	return nil
 }
 
-// AddSubnet добавляет подсеть
+const (
+	addSubnetMaxRetries     = 5
+	addSubnetInitialBackoff = 100 * time.Millisecond
+	addSubnetMaxBackoff     = 2 * time.Second
+)
+
+// AddSubnet добавляет подсеть с оптимистичным ретраем при гонках конфигурации.
+// Алгоритм:
+//   1) config-get
+//   2) добавление подсети и config-set
+//   3) повторный config-get и проверка, что подсеть действительно присутствует
+//   4) config-write после успешной валидации
+//
+// Если между нашими config-get и config-set другой клиент перезапишет конфиг,
+// мы обнаружим, что "наша" подсеть отсутствует в свежем config-get и повторим
+// операцию с экспоненциальной задержкой.
 func (c *Client) AddSubnet(ctx context.Context, subnet Subnet4) error {
-	// Не все сборки Kea поддерживают online-команды вида "subnet4-add".
-	// Универсальный путь через Control Agent:
-	//   config-get -> правка -> config-set -> config-write.
-	cfg, err := c.GetConfig(ctx)
-	if err != nil {
-		return err
+	backoff := addSubnetInitialBackoff
+
+	for attempt := 0; attempt < addSubnetMaxRetries; attempt++ {
+		assignedID, err := c.addSubnetOnce(ctx, subnet)
+		if err != nil {
+			// В случае ошибки сразу решаем — либо ретрай, либо выходим.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if attempt == addSubnetMaxRetries-1 {
+				return fmt.Errorf("failed to add subnet after %d attempts: %w", addSubnetMaxRetries, err)
+			}
+			if err := sleepWithBackoff(ctx, backoff); err != nil {
+				return err
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+
+		ok, verifyErr := c.verifySubnetPresent(ctx, assignedID, subnet.Subnet)
+		if verifyErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if attempt == addSubnetMaxRetries-1 {
+				return fmt.Errorf("failed to verify subnet after %d attempts: %w", addSubnetMaxRetries, verifyErr)
+			}
+			if err := sleepWithBackoff(ctx, backoff); err != nil {
+				return err
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+
+		if !ok {
+			// Конфигурация была перезаписана другим клиентом, пробуем ещё раз.
+			if attempt == addSubnetMaxRetries-1 {
+				return fmt.Errorf("concurrent config update detected while adding subnet %s", subnet.Subnet)
+			}
+			if err := sleepWithBackoff(ctx, backoff); err != nil {
+				return err
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+
+		// На этом этапе подсеть гарантированно присутствует в последнем config-get.
+		if err := c.writeConfig(ctx); err != nil {
+			return err
+		}
+		return nil
 	}
 
-	var dhcp4 map[string]interface{}
-	if v, ok := cfg["Dhcp4"].(map[string]interface{}); ok {
-		dhcp4 = v
-	} else if v, ok := any(cfg).(map[string]interface{}); ok {
-		// если GetConfig вернул "чистый" dhcp4 конфиг
-		dhcp4 = v
-	} else {
-		return fmt.Errorf("unexpected config shape")
+	// Логически недостижимо, но необходимо для компиляции.
+	return fmt.Errorf("unreachable AddSubnet state")
+}
+
+// addSubnetOnce выполняет одну попытку добавления подсети:
+//   config-get -> правка -> config-set (без config-write).
+// Возвращает присвоенный подсети id.
+func (c *Client) addSubnetOnce(ctx context.Context, subnet Subnet4) (int, error) {
+	cfg, err := c.GetConfig(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	dhcp4, err := extractDhcp4Config(cfg)
+	if err != nil {
+		return 0, err
 	}
 
 	// Берём текущий subnet4 (если есть)
@@ -186,15 +254,8 @@ func (c *Client) AddSubnet(ctx context.Context, subnet Subnet4) error {
 				continue
 			}
 			if v, ok := m["id"]; ok {
-				switch n := v.(type) {
-				case float64:
-					if int(n) > maxID {
-						maxID = int(n)
-					}
-				case int:
-					if n > maxID {
-						maxID = n
-					}
+				if id, ok := toInt(v); ok && id > maxID {
+					maxID = id
 				}
 			}
 		}
@@ -203,25 +264,86 @@ func (c *Client) AddSubnet(ctx context.Context, subnet Subnet4) error {
 	// Добавляем новый subnet4 как map (через marshal/unmarshal для простоты)
 	subnetBytes, err := json.Marshal(subnet)
 	if err != nil {
-		return fmt.Errorf("failed to marshal subnet: %w", err)
+		return 0, fmt.Errorf("failed to marshal subnet: %w", err)
 	}
 	var subnetMap map[string]any
 	if err := json.Unmarshal(subnetBytes, &subnetMap); err != nil {
-		return fmt.Errorf("failed to unmarshal subnet: %w", err)
+		return 0, fmt.Errorf("failed to unmarshal subnet: %w", err)
 	}
+
 	// Kea требует обязательный уникальный id для каждой подсети.
-	if _, ok := subnetMap["id"]; !ok || subnetMap["id"] == 0 {
-		subnetMap["id"] = maxID + 1
+	assignedID := 0
+	if v, ok := subnetMap["id"]; ok {
+		if id, ok := toInt(v); ok && id > 0 {
+			assignedID = id
+		}
 	}
+	if assignedID == 0 {
+		assignedID = maxID + 1
+		subnetMap["id"] = assignedID
+	}
+
 	subnet4List = append(subnet4List, subnetMap)
 	dhcp4["subnet4"] = subnet4List
 
-	// 1) применяем новую конфигурацию к работающему серверу
+	// Применяем новую конфигурацию к работающему серверу
 	if err := c.SetConfig(ctx, map[string]any{"Dhcp4": dhcp4}); err != nil {
-		return err
+		return 0, err
 	}
 
-	// 2) сохраняем конфигурацию в JSON-файл на диске
+	return assignedID, nil
+}
+
+// verifySubnetPresent проверяет по свежему config-get, что подсеть с заданным id
+// и CIDR действительно присутствует. Это даёт оптимистичную гарантию, что
+// наш config-set не был "перетёрт" другим клиентом.
+func (c *Client) verifySubnetPresent(ctx context.Context, id int, cidr string) (bool, error) {
+	cfg, err := c.GetConfig(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	dhcp4, err := extractDhcp4Config(cfg)
+	if err != nil {
+		return false, err
+	}
+
+	subnets, ok := dhcp4["subnet4"].([]any)
+	if !ok {
+		return false, nil
+	}
+
+	for _, s := range subnets {
+		m, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+		rawID, ok := m["id"]
+		if !ok {
+			continue
+		}
+		curID, ok := toInt(rawID)
+		if !ok || curID != id {
+			continue
+		}
+
+		rawSubnet, ok := m["subnet"].(string)
+		if !ok {
+			// id совпал, но структура неожиданная — считаем, что конфиг изменён
+			return false, nil
+		}
+		if rawSubnet == cidr {
+			return true, nil
+		}
+		// id совпал, но другая подсеть — конфиг изменён конкурирующим клиентом
+		return false, nil
+	}
+
+	return false, nil
+}
+
+// writeConfig выполняет config-write для текущей конфигурации.
+func (c *Client) writeConfig(ctx context.Context) error {
 	writeCmd := Command{
 		Command: "config-write",
 		Service: []string{"dhcp4"},
@@ -233,6 +355,68 @@ func (c *Client) AddSubnet(ctx context.Context, subnet Subnet4) error {
 	if resp.Result != 0 {
 		return fmt.Errorf("kea error during config-write: %s", resp.Text)
 	}
-
 	return nil
+}
+
+// extractDhcp4Config извлекает объект Dhcp4 из ответа config-get.
+func extractDhcp4Config(cfg map[string]interface{}) (map[string]interface{}, error) {
+	if v, ok := cfg["Dhcp4"].(map[string]interface{}); ok {
+		return v, nil
+	}
+	if v, ok := any(cfg).(map[string]interface{}); ok {
+		// если GetConfig вернул "чистый" dhcp4 конфиг
+		return v, nil
+	}
+	return nil, fmt.Errorf("unexpected config shape")
+}
+
+// toInt аккуратно приводит значение id (float64/int/строка) к int.
+func toInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int32:
+		return int(n), true
+	case int64:
+		return int(n), true
+	case float32:
+		return int(n), true
+	case float64:
+		return int(n), true
+	case string:
+		var parsed int
+		if _, err := fmt.Sscanf(n, "%d", &parsed); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+// sleepWithBackoff делает паузу с учётом контекста.
+func sleepWithBackoff(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// nextBackoff считает следующий шаг экспоненциального backoff.
+func nextBackoff(current time.Duration) time.Duration {
+	if current <= 0 {
+		return addSubnetInitialBackoff
+	}
+	next := current * 2
+	if next > addSubnetMaxBackoff {
+		return addSubnetMaxBackoff
+	}
+	return next
 }
