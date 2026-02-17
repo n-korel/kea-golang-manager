@@ -1,0 +1,35 @@
+services:
+  kea-dhcp4:
+    image: jonasal/kea-dhcp4:2
+    container_name: kea-dhcp4
+    volumes:
+      - ./config:/kea/config
+      - kea-socket:/kea/sockets
+      - kea-leases:/kea/leases
+    networks:
+      - kea-network
+    restart: unless-stopped
+    command: -c /kea/config/kea-dhcp4.conf
+
+  kea-control-agent:
+    image: jonasal/kea-ctrl-agent:2
+    container_name: kea-control-agent
+    volumes:
+      - ./config:/kea/config
+      - kea-socket:/kea/sockets
+    networks:
+      - kea-network
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    command: -c /kea/config/kea-ctrl-agent.conf
+    depends_on:
+      - kea-dhcp4
+
+volumes:
+  kea-socket:
+  kea-leases:
+
+networks:
+  kea-network:
+    driver: bridge
