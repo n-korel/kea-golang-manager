@@ -112,7 +112,7 @@ func (s *DHCPService) WriteConfigAndReload(ctx context.Context) error {
 	return s.client.WriteConfigAndReload(ctx)
 }
 
-// Lease4Stats возвращает статистику лизов DHCPv4 (statistic-get).
+// Lease4Stats возвращает статистику лизов DHCPv4 (statistic-get-all).
 func (s *DHCPService) Lease4Stats(ctx context.Context) (map[string]interface{}, error) {
 	return s.client.Lease4Stats(ctx)
 }

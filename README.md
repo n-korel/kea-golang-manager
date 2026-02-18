@@ -189,7 +189,7 @@ curl -s http://localhost:8080/health | jq
 
 #### `GET /stats`
 
-Lease-статистика напрямую от Kea (команда `statistic-get`).
+Lease-статистика напрямую от Kea (команда `statistic-get-all`).
 
 ```bash
 curl -s http://localhost:8080/stats | jq

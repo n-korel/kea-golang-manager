@@ -167,12 +167,13 @@ func (c *Client) WriteConfigAndReload(ctx context.Context) error {
 	return c.Reload(ctx)
 }
 
-// Lease4Stats возвращает статистику лизов DHCPv4 (команда statistic-get для dhcp4).
+// Lease4Stats возвращает статистику лизов DHCPv4 (команда statistic-get-all для dhcp4).
 // При отсутствии хука или ошибке возвращает nil map и ошибку.
 func (c *Client) Lease4Stats(ctx context.Context) (map[string]interface{}, error) {
 	cmd := Command{
-		Command: "statistic-get",
-		Service: []string{"dhcp4"},
+		Command:   "statistic-get-all",
+		Service:   []string{"dhcp4"},
+		Arguments: map[string]interface{}{},
 	}
 	resp, err := c.executeCommand(ctx, cmd)
 	if err != nil {
