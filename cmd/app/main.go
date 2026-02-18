@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"kea-golang-manager/internal/api"
@@ -54,9 +56,26 @@ func main() {
 			IdleTimeout:  60 * time.Second,
 		}
 
-		log.Printf("Starting HTTP server on %s", *httpAddr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server failed: %v", err)
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+		go func() {
+			log.Printf("Starting HTTP server on %s", *httpAddr)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("HTTP server failed: %v", err)
+			}
+		}()
+
+		<-quit
+		log.Println("Shutting down HTTP server...")
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown: %v", err)
+		} else {
+			log.Println("HTTP server stopped gracefully")
 		}
 	case "add-subnet":
 		if err := handleAddSubnet(ctx, dhcpService, args[1:]); err != nil {
