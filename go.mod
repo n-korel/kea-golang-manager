@@ -2,4 +2,7 @@ module kea-golang-manager
 
 go 1.22
 
-require github.com/go-chi/chi/v5 v5.2.5 // indirect
+require (
+	github.com/go-chi/chi/v5 v5.2.5
+	github.com/gosnmp/gosnmp v1.37.0
+)

@@ -102,9 +102,19 @@ func (s *DHCPService) GetConfig(ctx context.Context) (map[string]interface{}, er
 	return s.client.GetConfig(ctx)
 }
 
-// Reload перезагружает конфигурацию
+// Reload перезагружает конфигурацию (только config-reload).
 func (s *DHCPService) Reload(ctx context.Context) error {
 	return s.client.Reload(ctx)
+}
+
+// WriteConfigAndReload выполняет config-write, затем config-reload (reload_policy).
+func (s *DHCPService) WriteConfigAndReload(ctx context.Context) error {
+	return s.client.WriteConfigAndReload(ctx)
+}
+
+// Lease4Stats возвращает статистику лизов DHCPv4 (statistic-get).
+func (s *DHCPService) Lease4Stats(ctx context.Context) (map[string]interface{}, error) {
+	return s.client.Lease4Stats(ctx)
 }
 
 // DeleteSubnet удаляет подсеть по ID.

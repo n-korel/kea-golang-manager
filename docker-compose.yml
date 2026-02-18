@@ -1,35 +1,61 @@
-services:
-  kea-dhcp4:
-    image: jonasal/kea-dhcp4:2
-    container_name: kea-dhcp4
-    volumes:
-      - ./config:/kea/config
-      - kea-socket:/kea/sockets
-      - kea-leases:/kea/leases
-    networks:
-      - kea-network
-    restart: unless-stopped
-    command: -c /kea/config/kea-dhcp4.conf
+# Kea Active-Standby HA: host network, separate nodes, no bridge.
+# For single-host dev both nodes use 127.0.0.1; for two hosts replace with real IPs in configs.
 
-  kea-control-agent:
-    image: jonasal/kea-ctrl-agent:2
-    container_name: kea-control-agent
+services:
+  kea-primary-dhcp4:
+    image: jonasal/kea-dhcp4:2
+    container_name: kea-primary-dhcp4
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
     volumes:
       - ./config:/kea/config
-      - kea-socket:/kea/sockets
-    networks:
-      - kea-network
-    ports:
-      - "8000:8000"
-    restart: unless-stopped
-    command: -c /kea/config/kea-ctrl-agent.conf
+      - kea-socket-primary:/kea/sockets
+      - kea-leases-primary:/kea/leases
+    restart: always
+    command: -c /kea/config/kea-dhcp4-primary.conf
+
+  kea-primary-ctrl-agent:
+    image: jonasal/kea-ctrl-agent:2
+    container_name: kea-primary-ctrl-agent
+    network_mode: host
+    volumes:
+      - ./config:/kea/config
+      - kea-socket-primary:/kea/sockets
+    restart: always
+    command: -c /kea/config/kea-ctrl-agent-primary.conf
     depends_on:
-      - kea-dhcp4
+      - kea-primary-dhcp4
+
+  kea-standby-dhcp4:
+    image: jonasal/kea-dhcp4:2
+    container_name: kea-standby-dhcp4
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - ./config:/kea/config
+      - kea-socket-standby:/kea/sockets
+      - kea-leases-standby:/kea/leases
+    restart: always
+    command: -c /kea/config/kea-dhcp4-standby.conf
+
+  kea-standby-ctrl-agent:
+    image: jonasal/kea-ctrl-agent:2
+    container_name: kea-standby-ctrl-agent
+    network_mode: host
+    volumes:
+      - ./config:/kea/config
+      - kea-socket-standby:/kea/sockets
+    restart: always
+    command: -c /kea/config/kea-ctrl-agent-standby.conf
+    depends_on:
+      - kea-standby-dhcp4
 
 volumes:
-  kea-socket:
-  kea-leases:
-
-networks:
-  kea-network:
-    driver: bridge
+  kea-socket-primary:
+  kea-socket-standby:
+  kea-leases-primary:
+  kea-leases-standby:

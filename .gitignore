@@ -10,4 +10,4 @@ vendor/
 .env
 *.log
 
-bin/
+bin

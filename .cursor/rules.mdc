@@ -1,0 +1,305 @@
+---
+alwaysApply: true
+
+version: 1
+
+project:
+  name: kea-ha-orchestrator
+  stack:
+    dhcp: "Kea DHCP"
+    backend: "Go"
+    deployment: "Docker (host network)"
+    ha_mode: "Active-Standby"
+    lease_backend: "memfile"
+    integrations:
+      - SNMP
+      - LLDP
+
+topology:
+  nodes:
+    - name: kea-primary
+      role: primary
+      dhcp4_port: 67
+      control_agent_port: 8000
+    - name: kea-standby
+      role: standby
+      dhcp4_port: 67
+      control_agent_port: 8001
+  ha_link: "direct IP reachability between nodes (host network)"
+  orchestrator_port: 8080
+
+# =========================================================
+# GLOBAL RULES
+# =========================================================
+
+global_rules:
+  - id: no-dhcp-reimplementation
+    description: >
+      Do not implement DHCP protocol logic in Go. Kea is the sole DHCP engine.
+
+  - id: no-database
+    description: >
+      Do not introduce MySQL, PostgreSQL, or any external lease database.
+
+  - id: active-standby-only
+    description: >
+      Strict 2-node Active-Standby topology. Multi-primary is forbidden.
+
+  - id: no-distributed-consensus
+    description: >
+      Do not introduce etcd, consul, raft, or other consensus systems.
+
+  - id: deterministic-behavior
+    description: >
+      Prefer explicit configuration and deterministic state transitions.
+
+# =========================================================
+# HA AUTHORITY MODEL
+# =========================================================
+
+ha_authority:
+  - Kea HA-hook is the single authority for role transitions.
+  - Backend must not independently promote or demote nodes.
+  - Backend may only:
+      - Observe HA state
+      - Trigger maintenance mode
+      - Trigger forced demotion in split-brain mitigation
+  - Backend must never implement its own election algorithm.
+
+# =========================================================
+# CONFIG AUTHORITY MODEL
+# =========================================================
+
+config_authority:
+  - Backend is the canonical configuration source.
+  - Kea runtime configuration must reflect backend state.
+  - On startup, backend must reconcile its model with Kea runtime config.
+  - Config mutations must be serialized (single-writer policy).
+  - Concurrent config writes are forbidden.
+
+# =========================================================
+# KEA RULES
+# =========================================================
+
+kea_rules:
+  ha:
+    required: true
+    mode: "passive-backup"
+    multi_primary: false
+    constraints:
+      - Must configure heartbeat-delay
+      - Must configure max-unacked-clients
+      - Must configure sync-timeout
+      - Must expose control-socket
+      - Must expose HA status endpoint
+      - heartbeat-delay must be >= 10000 ms
+      - max-unacked-clients must be explicitly set (recommended: 5)
+      - sync-timeout must be explicitly set (recommended: 60000 ms)
+
+    forbidden:
+      - load-balancing mode
+      - multi-primary mode
+      - database lease backend
+      - implicit HA timing defaults
+
+  lease_backend:
+    type: "memfile"
+    persistence_required: false
+    notes:
+      - Lease loss after crash is acceptable
+      - Backend must not simulate lease durability
+
+  reload_policy:
+    - Use Control Agent config-set for updates
+    - Always call config-write after config-set
+    - config-write must be executed on the same node
+    - Use config-reload only when required
+    - Reload operations must be externally observable
+    - Never edit Kea config files directly
+
+# =========================================================
+# DOCKER RULES
+# =========================================================
+
+docker_rules:
+  networking:
+    required_mode: "host"
+    constraints:
+      - Must preserve broadcast capability
+      - Must allow raw sockets
+      - Must include CAP_NET_RAW
+      - Must include CAP_NET_ADMIN
+      - Must avoid bridge/NAT networking for DHCP
+      - kea-primary and kea-standby must be separate services
+      - Each node must have its own Control Agent port
+
+  restart_policy:
+    - Containers must restart automatically
+    - Restart must not imply role promotion
+    - Role must always be derived from HA status endpoint
+
+# =========================================================
+# BACKEND RULES
+# =========================================================
+
+backend_rules:
+  package_structure:
+    - internal/kea/
+    - internal/ha/
+    - internal/snmp/
+    - internal/lldp/
+    - internal/api/
+    - internal/service/
+    - pkg/config/
+
+  responsibilities:
+    - Observe HA state
+    - Aggregate health signals
+    - Manage DHCP configuration
+    - Poll SNMP
+    - Correlate LLDP topology
+    - Expose REST API
+
+  forbidden:
+    - Lease manipulation
+    - Direct lease file editing
+    - DHCP packet crafting
+    - Role override without HA verification
+    - Implementing election logic
+    - Global mutable HA role state
+
+  role_detection:
+    - Current role must be derived from Kea HA status endpoint
+    - Backend must not infer role from network reachability alone
+
+  api_endpoints_required:
+    - path: "/health"
+    - path: "/ha/status"
+    - path: "/kea/reload"
+    - path: "/stats"
+
+  design_constraints:
+    - Use context.Context everywhere
+    - No global mutable state
+    - Structured logging only
+    - HA monitor must run as separate goroutine
+    - Graceful shutdown required
+    - All timeouts configurable
+    - Config mutations must be atomic from API perspective
+
+# =========================================================
+# FAILOVER OBSERVATION RULES
+# =========================================================
+
+failover_rules:
+  detection_sources:
+    - Control Agent responsiveness
+    - HA status endpoint
+    - Network reachability
+
+  required_failure_models:
+    - kea_process_crash
+    - control_agent_crash
+    - ha_link_failure
+    - network_partition
+    - container_restart
+    - host_reboot
+
+  timing:
+    min_detection_interval: 3
+    observation_only: true   # Backend observes; does not promote
+
+  split_brain_prevention:
+    - Must detect HA-link loss explicitly
+    - Must detect dual-primary state
+    - Forced demotion must be available via API
+    - Must perform quorum verification before demotion
+    - Backend must log split-brain incidents as critical
+
+# =========================================================
+# SNMP RULES
+# =========================================================
+
+snmp_rules:
+  role: "monitoring_only"
+  constraints:
+    - Must not be sole source of failover decisions
+    - Must use timeout-safe polling
+    - Must not block orchestration loop
+    - Prefer SNMPv3
+    - Credentials must come from environment variables
+
+# =========================================================
+# LLDP RULES
+# =========================================================
+
+lldp_rules:
+  role: "topology_enrichment"
+  constraints:
+    - Must not block DHCP operations
+    - Used only for MAC → port → VLAN mapping
+    - Must tolerate stale topology data
+
+# =========================================================
+# TESTING RULES
+# =========================================================
+
+testing_rules:
+  required_scenarios:
+    - kill_primary
+    - restart_secondary
+    - ha_link_drop
+    - network_partition
+    - renewal_storm
+    - simultaneous_restart
+
+  expectations:
+    - Final HA state must be asserted
+    - Dual-primary must never persist
+    - Tests must use real Kea containers
+    - Tests must validate role consistency via HA endpoint
+
+# =========================================================
+# OBSERVABILITY RULES
+# =========================================================
+
+observability_rules:
+  required_exports:
+    - current_role
+    - peer_status
+    - ha_state
+    - last_failover_reason
+    - last_role_change_timestamp
+
+  logging:
+    - Structured logging only
+    - Log role transitions
+    - Log failover cause
+    - Log HA-link changes
+    - Log split-brain detection
+    - Log level configurable
+
+# =========================================================
+# SECURITY RULES
+# =========================================================
+
+security_rules:
+  - Control Agent must not be publicly exposed
+  - No hardcoded credentials
+  - /ha/status and /ha/demote must be restricted or authenticated
+  - SNMP secrets from environment variables only
+  - Internal Kea control socket must not be externally exposed
+
+# =========================================================
+# NON-GOALS
+# =========================================================
+
+non_goals:
+  - active_active_mode
+  - load_balancing_dhcp
+  - external_fencing_daemon
+  - lease_database_backend
+  - distributed_consensus
+  - custom_dhcp_implementation
+
+---

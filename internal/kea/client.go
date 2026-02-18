@@ -26,6 +26,12 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 	}
 }
 
+// ExecuteCommand выполняет произвольную команду через REST API Control Agent.
+// Используется в том числе для ha-status и ha-heartbeat (internal/ha).
+func (c *Client) ExecuteCommand(ctx context.Context, cmd Command) (*Response, error) {
+	return c.executeCommand(ctx, cmd)
+}
+
 // executeCommand выполняет команду через REST API.
 // В разных версиях Kea/Control Agent встречаются оба формата:
 // - запрос как объект (map)
@@ -135,7 +141,7 @@ func (c *Client) SetConfig(ctx context.Context, config map[string]interface{}) e
 	return nil
 }
 
-// Reload перезагружает конфигурацию
+// Reload перезагружает конфигурацию (только config-reload).
 func (c *Client) Reload(ctx context.Context) error {
 	cmd := Command{
 		Command: "config-reload",
@@ -152,6 +158,34 @@ func (c *Client) Reload(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// WriteConfigAndReload выполняет config-write, затем config-reload на этом узле (reload_policy).
+func (c *Client) WriteConfigAndReload(ctx context.Context) error {
+	if err := c.writeConfig(ctx); err != nil {
+		return err
+	}
+	return c.Reload(ctx)
+}
+
+// Lease4Stats возвращает статистику лизов DHCPv4 (команда statistic-get для dhcp4).
+// При отсутствии хука или ошибке возвращает nil map и ошибку.
+func (c *Client) Lease4Stats(ctx context.Context) (map[string]interface{}, error) {
+	cmd := Command{
+		Command: "statistic-get",
+		Service: []string{"dhcp4"},
+	}
+	resp, err := c.executeCommand(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Result != 0 {
+		return nil, fmt.Errorf("kea error: %s", resp.Text)
+	}
+	if resp.Arguments == nil {
+		return map[string]interface{}{}, nil
+	}
+	return resp.Arguments, nil
 }
 
 // ListSubnets возвращает список подсетей из текущей конфигурации.
