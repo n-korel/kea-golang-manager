@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,19 +14,14 @@ import (
 	"time"
 
 	"kea-golang-manager/internal/api"
-	"kea-golang-manager/internal/ha"
 	"kea-golang-manager/internal/kea"
-	"kea-golang-manager/internal/lldp"
 	"kea-golang-manager/internal/service"
-	"kea-golang-manager/internal/snmp"
 	"kea-golang-manager/pkg/config"
 )
 
 func main() {
-	// Глобальные флаги (общие для всех команд)
 	globalFS := flag.NewFlagSet("global", flag.ExitOnError)
-	keaURL := globalFS.String("kea-url", "http://localhost:8000", "Kea Control Agent URL (primary)")
-	keaStandbyURL := globalFS.String("kea-standby-url", "http://localhost:8001", "Kea Control Agent URL (standby); empty disables HA")
+	keaURL := globalFS.String("kea-url", "http://localhost:8000", "Kea Control Agent URL")
 	timeout := globalFS.Duration("timeout", 10*time.Second, "HTTP request timeout")
 	httpAddr := globalFS.String("http-addr", ":8080", "HTTP server listen address")
 
@@ -42,10 +36,7 @@ func main() {
 	}
 
 	command := args[0]
-
 	cfg := config.New(*keaURL, *timeout)
-	cfg.KeaPrimaryURL = *keaURL
-	cfg.KeaStandbyURL = *keaStandbyURL
 	client := kea.NewClient(cfg.KeaURL, cfg.Timeout)
 	dhcpService := service.NewDHCPService(client)
 
@@ -54,40 +45,7 @@ func main() {
 
 	switch command {
 	case "serve-http":
-		var haStore *ha.StateStore
-		var haClient *ha.HAClient
-		var standbyClient *kea.Client
-		var monitorCancel context.CancelFunc
-		snmpCfg := snmp.ConfigFromEnv()
-		snmpPoller := snmp.NewPoller(snmpCfg, slog.Default())
-		lldpCollector := lldp.NewCollector("", 2*time.Minute, slog.Default())
-
-		svcCtx, svcCancel := context.WithCancel(context.Background())
-		go snmpPoller.Run(svcCtx)
-		go lldpCollector.Run(svcCtx)
-
-		if cfg.KeaStandbyURL != "" {
-			haStore = ha.NewStateStore()
-			haClient = ha.NewHAClient(cfg.KeaPrimaryURL, cfg.KeaStandbyURL, cfg.Timeout)
-			standbyClient = kea.NewClient(cfg.KeaStandbyURL, cfg.Timeout)
-			monitorCfg := ha.MonitorConfig{
-				PollInterval: cfg.HAPollInterval,
-				MinFailures:  cfg.HAMinFailures,
-			}
-			monitorCtx, cancelFn := context.WithCancel(context.Background())
-			monitorCancel = cancelFn
-			go ha.Run(monitorCtx, haStore, haClient, monitorCfg, slog.Default())
-		}
-
-		handler := api.NewHandler(api.HandlerOpts{
-			DHCPService:   dhcpService,
-			HAStore:       haStore,
-			HAClient:      haClient,
-			PrimaryClient: client,
-			StandbyClient: standbyClient,
-			SNMPPoller:     snmpPoller,
-			LLDPCollector:  lldpCollector,
-		})
+		handler := api.NewHandler(api.HandlerOpts{DHCPService: dhcpService})
 		server := &http.Server{
 			Addr:         *httpAddr,
 			Handler:      handler,
@@ -107,10 +65,6 @@ func main() {
 		}()
 
 		<-quit
-		svcCancel()
-		if monitorCancel != nil {
-			monitorCancel()
-		}
 		log.Println("Shutting down HTTP server...")
 
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -202,10 +156,9 @@ func printUsage() {
 	fmt.Println("  kea-manager add-subnet -subnet=<CIDR> [-pools=<pool1,pool2>] [-hw-address=<mac>] [-ip-address=<ip>] [-hostname=<name>]")
 	fmt.Println("  kea-manager reload")
 	fmt.Println("  kea-manager show-config")
-	fmt.Println("  kea-manager serve-http [-http-addr=:8080] [-kea-standby-url=...]")
+	fmt.Println("  kea-manager serve-http [-http-addr=:8080]")
 	fmt.Println("\nFlags:")
-	fmt.Println("  -kea-url string         Kea Control Agent URL primary (default: http://localhost:8000)")
-	fmt.Println("  -kea-standby-url string Kea Control Agent URL standby; empty disables HA (default: http://localhost:8001)")
-	fmt.Println("  -timeout duration       HTTP request timeout (default: 10s)")
-	fmt.Println("  -http-addr string       HTTP server listen address (default: :8080)")
+	fmt.Println("  -kea-url string    Kea Control Agent URL (default: http://localhost:8000)")
+	fmt.Println("  -timeout duration  HTTP request timeout (default: 10s)")
+	fmt.Println("  -http-addr string  HTTP server listen address (default: :8080)")
 }

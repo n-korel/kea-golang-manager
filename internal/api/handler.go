@@ -11,50 +11,27 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"kea-golang-manager/internal/ha"
 	"kea-golang-manager/internal/kea"
-	"kea-golang-manager/internal/lldp"
 	"kea-golang-manager/internal/service"
-	"kea-golang-manager/internal/snmp"
 )
 
 const requestTimeout = 15 * time.Second
 
-// HandlerOpts — опции для создания HTTP-обработчика (обязателен только DHCPService).
+// HandlerOpts — опции для создания HTTP-обработчика.
 type HandlerOpts struct {
-	DHCPService    *service.DHCPService
-	HAStore        *ha.StateStore
-	HAClient       *ha.HAClient
-	PrimaryClient  *kea.Client
-	StandbyClient  *kea.Client
-	SNMPPoller     *snmp.Poller
-	LLDPCollector  *lldp.Collector
+	DHCPService *service.DHCPService
 }
 
-// NewHandler создаёт HTTP-обработчик с REST API (backend_rules.api_endpoints_required).
+// NewHandler создаёт HTTP-обработчик с REST API.
 func NewHandler(opts HandlerOpts) http.Handler {
-	h := &handler{
-		dhcpService:   opts.DHCPService,
-		haStore:       opts.HAStore,
-		haClient:      opts.HAClient,
-		primaryClient: opts.PrimaryClient,
-		standbyClient: opts.StandbyClient,
-		snmpPoller:    opts.SNMPPoller,
-		lldpCollector: opts.LLDPCollector,
-	}
+	h := &handler{dhcpService: opts.DHCPService}
 
 	r := chi.NewRouter()
-
 	r.Get("/health", h.getHealth)
-	r.Get("/ha/status", h.getHAStatus)
-	r.Post("/ha/demote", h.postHADemote)
-
 	r.Get("/config", h.getConfig)
 	r.Post("/reload", h.reload)
 	r.Post("/kea/reload", h.reload)
-
 	r.Get("/stats", h.getStats)
-
 	r.Route("/subnets", func(r chi.Router) {
 		r.Get("/", h.listSubnets)
 		r.Post("/", h.addSubnet)
@@ -65,146 +42,60 @@ func NewHandler(opts HandlerOpts) http.Handler {
 }
 
 type handler struct {
-	dhcpService   *service.DHCPService
-	haStore       *ha.StateStore
-	haClient      *ha.HAClient
-	primaryClient *kea.Client
-	standbyClient *kea.Client
-	snmpPoller    *snmp.Poller
-	lldpCollector *lldp.Collector
-}
-
-func (h *handler) getHealth(w http.ResponseWriter, r *http.Request) {
-	_, cancel := context.WithTimeout(r.Context(), requestTimeout)
-	defer cancel()
-
-	if h.haStore == nil {
-		writeJSON(w, http.StatusOK, healthResponse{
-			Status:  "ok",
-			Primary: nil,
-			Standby: nil,
-		})
-		return
-	}
-
-	status, primaryObs, standbyObs := h.haStore.GetStatusSnapshot()
-	primaryBlock := nodeHealthFromObs(primaryObs, "primary")
-	standbyBlock := nodeHealthFromObs(standbyObs, "standby")
-
-	aggStatus := "ok"
-	if !primaryBlock.Reachable && !standbyBlock.Reachable {
-		aggStatus = "critical"
-	} else if !primaryBlock.Reachable || !standbyBlock.Reachable || status.HAState == ha.HAStatePartnerDown {
-		aggStatus = "degraded"
-	}
-
-	resp := healthResponse{
-		Status:  aggStatus,
-		Primary: primaryBlock,
-		Standby: standbyBlock,
-	}
-
-	code := http.StatusOK
-	if aggStatus == "critical" {
-		code = http.StatusServiceUnavailable
-	}
-	writeJSON(w, code, resp)
+	dhcpService *service.DHCPService
 }
 
 type healthResponse struct {
-	Status  string       `json:"status"`
-	Primary *nodeHealth  `json:"primary,omitempty"`
-	Standby *nodeHealth  `json:"standby,omitempty"`
+	Status string     `json:"status"`
+	Kea    *keaHealth `json:"kea,omitempty"`
 }
 
-type nodeHealth struct {
-	Reachable bool   `json:"reachable"`
-	HAState   string `json:"ha_state"`
+type keaHealth struct {
+	Reachable bool `json:"reachable"`
 }
 
-func nodeHealthFromObs(obs *ha.Observation, node string) *nodeHealth {
-	if obs == nil {
-		return &nodeHealth{Reachable: false, HAState: ha.HAStateReady}
-	}
-	return &nodeHealth{
-		Reachable: obs.Reachable,
-		HAState:   obs.HAState,
-	}
-}
-
-func (h *handler) getHAStatus(w http.ResponseWriter, r *http.Request) {
-	_, cancel := context.WithTimeout(r.Context(), requestTimeout)
-	defer cancel()
-
-	if h.haStore == nil {
-		writeError(w, http.StatusServiceUnavailable, errors.New("HA not configured"))
-		return
-	}
-	st := h.haStore.GetStatus()
-	writeJSON(w, http.StatusOK, st)
-}
-
-type demoteRequest struct {
-	Node    string `json:"node"`
-	Confirm bool   `json:"confirm"`
-}
-
-func (h *handler) postHADemote(w http.ResponseWriter, r *http.Request) {
+func (h *handler) getHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 
-	if h.haClient == nil || h.haStore == nil {
-		writeError(w, http.StatusServiceUnavailable, errors.New("HA not configured"))
-		return
-	}
+	_, err := h.dhcpService.GetConfig(ctx)
+	reachable := err == nil
 
-	var req demoteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+	if !reachable {
+		writeJSON(w, http.StatusServiceUnavailable, healthResponse{
+			Status: "error",
+			Kea:    &keaHealth{Reachable: false},
+		})
 		return
 	}
-	if !req.Confirm {
-		writeError(w, http.StatusBadRequest, errors.New("confirm is required and must be true"))
-		return
-	}
-	if req.Node != ha.NodePrimary && req.Node != ha.NodeStandby {
-		writeError(w, http.StatusBadRequest, errors.New("node must be \"primary\" or \"standby\""))
-		return
-	}
+	writeJSON(w, http.StatusOK, healthResponse{
+		Status: "ok",
+		Kea:    &keaHealth{Reachable: true},
+	})
+}
 
-	if err := h.haClient.MaintenanceStart(ctx, req.Node); err != nil {
-		slog.Error("ha_demote_failed", "node", req.Node, "error", err)
+func (h *handler) getConfig(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	cfg, err := h.dhcpService.GetConfig(ctx)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	slog.Info("ha_demote_triggered", "node", req.Node, "reason", "api_request")
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, cfg)
 }
 
 func (h *handler) reload(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 
-	if h.primaryClient != nil && h.standbyClient != nil {
-		if err := h.primaryClient.WriteConfigAndReload(ctx); err != nil {
-			slog.Error("kea_reload_failed", "node", "primary", "error", err)
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if err := h.standbyClient.WriteConfigAndReload(ctx); err != nil {
-			slog.Error("kea_reload_failed", "node", "standby", "error", err)
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		slog.Info("kea_reload_completed", "nodes", []string{"primary", "standby"})
-	} else {
-		if err := h.dhcpService.WriteConfigAndReload(ctx); err != nil {
-			slog.Error("kea_reload_failed", "error", err)
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		slog.Info("kea_reload_completed", "nodes", []string{"primary"})
+	if err := h.dhcpService.WriteConfigAndReload(ctx); err != nil {
+		slog.Error("kea_reload_failed", "error", err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
+	slog.Info("kea_reload_completed")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -212,51 +103,15 @@ func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 
-	haState := ""
-	if h.haStore != nil {
-		haState = h.haStore.GetStatus().HAState
-	}
-
-	leases, err := h.dhcpService.Lease4Stats(ctx)
+	stats, err := h.dhcpService.Lease4Stats(ctx)
 	if err != nil {
-		leases = nil
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
-
-	var snmpData *snmp.Snapshot
-	if h.snmpPoller != nil {
-		s := h.snmpPoller.Snapshot()
-		snmpData = &s
+	if stats == nil {
+		stats = map[string]interface{}{}
 	}
-	var lldpData *lldp.Snapshot
-	if h.lldpCollector != nil {
-		s := h.lldpCollector.Snapshot()
-		lldpData = &s
-	}
-
-	resp := statsResponse{
-		HAState: haState,
-		Leases:  leases,
-		SNMP:    snmpData,
-		LLDP:    lldpData,
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-type statsResponse struct {
-	HAState string                 `json:"ha_state"`
-	Leases  map[string]interface{} `json:"leases,omitempty"`
-	SNMP    *snmp.Snapshot         `json:"snmp,omitempty"`
-	LLDP    *lldp.Snapshot         `json:"lldp,omitempty"`
-}
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-type addSubnetRequest struct {
-	Subnet       string            `json:"subnet"`
-	Pools        []string          `json:"pools"`
-	Reservations []kea.Reservation `json:"reservations,omitempty"`
+	writeJSON(w, http.StatusOK, stats)
 }
 
 func (h *handler) listSubnets(w http.ResponseWriter, r *http.Request) {
@@ -312,16 +167,14 @@ func (h *handler) deleteSubnet(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *handler) getConfig(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
-	defer cancel()
+type errorResponse struct {
+	Error string `json:"error"`
+}
 
-	cfg, err := h.dhcpService.GetConfig(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, cfg)
+type addSubnetRequest struct {
+	Subnet       string            `json:"subnet"`
+	Pools        []string          `json:"pools"`
+	Reservations []kea.Reservation `json:"reservations,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

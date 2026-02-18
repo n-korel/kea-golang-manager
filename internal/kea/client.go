@@ -27,7 +27,6 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 }
 
 // ExecuteCommand выполняет произвольную команду через REST API Control Agent.
-// Используется в том числе для ha-status и ha-heartbeat (internal/ha).
 func (c *Client) ExecuteCommand(ctx context.Context, cmd Command) (*Response, error) {
 	return c.executeCommand(ctx, cmd)
 }

@@ -18,8 +18,5 @@ docker-logs:
 test:
 	go test ./... -count=1
 
-test-integration:
-	go test -tags=integration ./internal/ha/ -v -count=1
-
 clean:
 	rm -rf bin/
