@@ -4,14 +4,16 @@ import "time"
 
 // Config представляет конфигурацию приложения
 type Config struct {
-	KeaURL  string
-	Timeout time.Duration
+	PrimaryURL string
+	StandbyURL string
+	Timeout    time.Duration
 }
 
 // New создает новую конфигурацию приложения
-func New(keaURL string, timeout time.Duration) *Config {
+func New(primaryURL, standbyURL string, timeout time.Duration) *Config {
 	return &Config{
-		KeaURL:  keaURL,
-		Timeout: timeout,
+		PrimaryURL: primaryURL,
+		StandbyURL: standbyURL,
+		Timeout:    timeout,
 	}
 }

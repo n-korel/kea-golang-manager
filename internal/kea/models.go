@@ -1,5 +1,15 @@
 package kea
 
+// Константы состояний HA из ha-heartbeat.
+const (
+	HAStateHotStandby            = "hot-standby"
+	HAStatePartnerDown           = "partner-down"
+	HAStateCommunicationRecovery = "communication-recovery"
+	HAStateSyncing               = "syncing"
+	HAStateWaiting               = "waiting"
+	HAStateReady                 = "ready"
+)
+
 // Command представляет команду для Kea Control Agent
 type Command struct {
 	Command string      `json:"command"`

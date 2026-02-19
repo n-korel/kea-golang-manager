@@ -188,6 +188,28 @@ func (c *Client) Lease4Stats(ctx context.Context) (map[string]interface{}, error
 	return resp.Arguments, nil
 }
 
+// HAHeartbeat выполняет ha-heartbeat на узле.
+// Возвращает строку state из Arguments (например "hot-standby").
+// Если узел недоступен или result != 0 — возвращает ошибку.
+func (c *Client) HAHeartbeat(ctx context.Context) (string, error) {
+	cmd := Command{
+		Command: "ha-heartbeat",
+		Service: []string{"dhcp4"},
+	}
+	resp, err := c.executeCommand(ctx, cmd)
+	if err != nil {
+		return "", err
+	}
+	if resp.Result != 0 {
+		return "", fmt.Errorf("kea error: %s", resp.Text)
+	}
+	state, ok := resp.Arguments["state"].(string)
+	if !ok || state == "" {
+		return "", fmt.Errorf("ha-heartbeat: missing or invalid state in response")
+	}
+	return state, nil
+}
+
 // ListSubnets возвращает список подсетей из текущей конфигурации.
 func (c *Client) ListSubnets(ctx context.Context) ([]Subnet4, error) {
 	cfg, err := c.GetConfig(ctx)

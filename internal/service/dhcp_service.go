@@ -1,23 +1,25 @@
 package service
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"fmt"
-	"kea-golang-manager/internal/kea"
 	"net"
 	"strings"
+
+	"kea-golang-manager/internal/ha"
+	"kea-golang-manager/internal/kea"
 )
 
 // DHCPService предоставляет бизнес-логику для работы с DHCP
 type DHCPService struct {
-	client *kea.Client
+	haManager *ha.HAManager
 }
 
 // NewDHCPService создает новый сервис DHCP
-func NewDHCPService(client *kea.Client) *DHCPService {
+func NewDHCPService(haManager *ha.HAManager) *DHCPService {
 	return &DHCPService{
-		client: client,
+		haManager: haManager,
 	}
 }
 
@@ -67,10 +69,10 @@ func (s *DHCPService) ValidatePool(subnet *net.IPNet, pool string) error {
 	return nil
 }
 
-// AddSubnet добавляет подсеть с валидацией
-func (s *DHCPService) AddSubnet(ctx context.Context, subnet string, pools []string, reservations []kea.Reservation) error {
+// AddSubnet добавляет подсеть с валидацией через GuardedApply.
+func (s *DHCPService) AddSubnet(ctx context.Context, subnet string, pools []string, reservations []kea.Reservation) (ha.ApplyResult, error) {
 	if err := s.ValidateSubnet(subnet); err != nil {
-		return err
+		return ha.ApplyResult{}, err
 	}
 
 	_, ipNet, _ := net.ParseCIDR(subnet)
@@ -78,7 +80,7 @@ func (s *DHCPService) AddSubnet(ctx context.Context, subnet string, pools []stri
 	keaPools := make([]kea.Pool, 0, len(pools))
 	for _, p := range pools {
 		if err := s.ValidatePool(ipNet, p); err != nil {
-			return err
+			return ha.ApplyResult{}, err
 		}
 		keaPools = append(keaPools, kea.Pool{Pool: p})
 	}
@@ -89,35 +91,55 @@ func (s *DHCPService) AddSubnet(ctx context.Context, subnet string, pools []stri
 		Reservations: reservations,
 	}
 
-	return s.client.AddSubnet(ctx, subnet4)
+	return s.haManager.GuardedApply(ctx, func(ctx context.Context, client *kea.Client) error {
+		return client.AddSubnet(ctx, subnet4)
+	})
 }
 
-// ListSubnets возвращает список подсетей.
+// ListSubnets возвращает список подсетей с активного узла.
 func (s *DHCPService) ListSubnets(ctx context.Context) ([]kea.Subnet4, error) {
-	return s.client.ListSubnets(ctx)
+	activeClient, err := s.haManager.ActiveClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return activeClient.ListSubnets(ctx)
 }
 
-// GetConfig получает текущую конфигурацию
+// GetConfig получает текущую конфигурацию с активного узла.
 func (s *DHCPService) GetConfig(ctx context.Context) (map[string]interface{}, error) {
-	return s.client.GetConfig(ctx)
+	activeClient, err := s.haManager.ActiveClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return activeClient.GetConfig(ctx)
 }
 
-// Reload перезагружает конфигурацию (только config-reload).
-func (s *DHCPService) Reload(ctx context.Context) error {
-	return s.client.Reload(ctx)
+// Reload перезагружает конфигурацию (config-reload) через GuardedApply.
+func (s *DHCPService) Reload(ctx context.Context) (ha.ApplyResult, error) {
+	return s.haManager.GuardedApply(ctx, func(ctx context.Context, client *kea.Client) error {
+		return client.Reload(ctx)
+	})
 }
 
-// WriteConfigAndReload выполняет config-write, затем config-reload (reload_policy).
-func (s *DHCPService) WriteConfigAndReload(ctx context.Context) error {
-	return s.client.WriteConfigAndReload(ctx)
+// WriteConfigAndReload выполняет config-write и config-reload через GuardedApply (reload_policy).
+func (s *DHCPService) WriteConfigAndReload(ctx context.Context) (ha.ApplyResult, error) {
+	return s.haManager.GuardedApply(ctx, func(ctx context.Context, client *kea.Client) error {
+		return client.WriteConfigAndReload(ctx)
+	})
 }
 
-// Lease4Stats возвращает статистику лизов DHCPv4 (statistic-get-all).
+// Lease4Stats возвращает статистику лизов DHCPv4 с активного узла (statistic-get-all).
 func (s *DHCPService) Lease4Stats(ctx context.Context) (map[string]interface{}, error) {
-	return s.client.Lease4Stats(ctx)
+	activeClient, err := s.haManager.ActiveClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return activeClient.Lease4Stats(ctx)
 }
 
-// DeleteSubnet удаляет подсеть по ID.
-func (s *DHCPService) DeleteSubnet(ctx context.Context, id int) error {
-	return s.client.DeleteSubnet(ctx, id)
+// DeleteSubnet удаляет подсеть по ID через GuardedApply.
+func (s *DHCPService) DeleteSubnet(ctx context.Context, id int) (ha.ApplyResult, error) {
+	return s.haManager.GuardedApply(ctx, func(ctx context.Context, client *kea.Client) error {
+		return client.DeleteSubnet(ctx, id)
+	})
 }

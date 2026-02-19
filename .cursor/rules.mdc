@@ -1,7 +1,7 @@
 ---
 alwaysApply: true
 
-version: 1
+version: 3
 
 project:
   name: kea-golang-manager
@@ -9,14 +9,17 @@ project:
     dhcp: "Kea DHCP"
     backend: "Go"
     deployment: "Docker Compose (bridge)"
-    ha_mode: "none"
+    ha_mode: "hot-standby"
     lease_backend: "memfile"
 
 topology:
   nodes:
-    - name: kea-dhcp4
-      dhcp4_port: 67
-      control_agent_port: 8000
+    - name: kea-primary
+      role: primary
+      control_agent_port: 8001
+    - name: kea-standby
+      role: standby
+      control_agent_port: 8002
   manager_port: 8080
 
 # =========================================================
@@ -34,38 +37,69 @@ global_rules:
       Do not introduce MySQL, PostgreSQL, or any external lease database.
       Use memfile only.
 
-  - id: no-ha
-    description: >
-      This project manages a single Kea node. Do not implement HA,
-      Active-Standby, failover logic, election algorithms, heartbeats,
-      or any multi-node coordination. Ever.
-
   - id: no-snmp-lldp
     description: >
-      Do not add SNMP or LLDP integrations. Kea's own statistic-get
-      provides all the monitoring data this project needs.
+      Do not add SNMP or LLDP integrations.
 
   - id: no-host-network
     description: >
-      Do not use network_mode: host in Docker. Use bridge networking
-      with explicit port mappings. host mode breaks on Windows / Docker Desktop.
+      Do not use network_mode: host in Docker.
+      Use bridge networking with explicit port mappings.
 
   - id: no-direct-lease-manipulation
     description: >
       Do not read, write, or parse Kea lease files directly.
       All operations go through the Control Agent HTTP API.
 
+  - id: kea-is-source-of-truth
+    description: >
+      Kea is the canonical source of configuration.
+      The manager does NOT maintain its own in-memory or on-disk config state.
+      All reads go to the active node via config-get.
+      Consequence: out-of-band edits to kea config files are not detected by the manager.
+      This is an explicit architectural decision accepted for this project scope.
+
 # =========================================================
 # CONFIG AUTHORITY MODEL
 # =========================================================
 
 config_authority:
-  - Backend is the canonical configuration source.
-  - All config changes go through Kea Control Agent (config-set).
-  - Always call config-write after config-set to persist to disk.
-  - config-write must be called on the same node as config-set.
-  - Concurrent config writes are forbidden (single-writer policy).
-  - Never edit Kea config files directly from Go code.
+  source_of_truth: "Kea — config-get on active node"
+
+  read_policy:
+    - Always read config from the active node (primary, or standby if primary is down)
+    - Never cache config in memory between requests
+
+  write_policy:
+    - id: guarded-apply
+      description: >
+        All config mutations use the following sequence:
+          1. Apply config-set + config-write on the active node
+          2. Call ha-heartbeat on active node — read current HA state
+          3a. If state == hot-standby: apply config-set + config-write on standby node
+          3b. If state != hot-standby: log warning, skip standby apply,
+              return HTTP 207 with {"warning": "standby apply skipped", "ha_state": "<state>"}
+          4. config-reload on active node
+          5. config-reload on standby node (only if step 3a succeeded)
+      rationale: >
+        libdhcp_ha.so synchronises LEASES only — not configuration.
+        If config is applied only to primary and primary fails, standby boots
+        with stale config and silently drops new subnets.
+        Applying config to standby when HA state is hot-standby is safe:
+        the standby is passive and config-set does not affect the lease state machine.
+        Skipping standby apply during communication-recovery or partner-down
+        prevents split-brain and state machine interference.
+
+    - id: config-write-always-follows-config-set
+      description: >
+        Always call config-write on the same node immediately after config-set.
+        config-set without config-write is forbidden.
+
+    - id: no-concurrent-writes
+      description: Single-writer policy. Concurrent config mutations are forbidden.
+
+    - id: never-edit-files-directly
+      description: Never edit kea config files directly from Go code.
 
 # =========================================================
 # KEA RULES
@@ -73,27 +107,67 @@ config_authority:
 
 kea_rules:
   ha:
-    required: false
-    forbidden:
-      - high-availability hook library
-      - passive-backup mode
-      - load-balancing mode
-      - heartbeat configuration
-      - peer configuration
+    required: true
+    mode: "hot-standby"
+    hook_libraries:
+      - libdhcp_lease_cmds.so   # required for ha-heartbeat and lease sync between peers
+      - libdhcp_ha.so           # HA state machine and automatic failover
+    notes:
+      - Primary handles all DHCP traffic; standby takes over on primary failure
+      - Lease sync is handled entirely by Kea HA hooks — manager does NOT sync leases
+      - Config sync is NOT handled by Kea HA hooks — manager applies config to both nodes
+      - Failover and failback are fully automatic via Kea's built-in HA state machine
+      - Manager does NOT implement election, failover, or failback logic
 
   lease_backend:
     type: "memfile"
     persistence_required: false
     notes:
-      - Lease loss after crash is acceptable
-      - Do not simulate or add durability guarantees
+      - Lease loss after simultaneous crash of both nodes is acceptable
 
   reload_policy:
-    - Use config-set to apply changes at runtime
-    - Always follow config-set with config-write
-    - Use config-reload to apply after config-write
-    - Reload must be observable (logged, returned in API response)
-    - Never edit kea-dhcp4.conf directly from Go code
+    step_1: config-set on active node
+    step_2: config-write on active node
+    step_3: ha-heartbeat on active node → check state
+    step_4a: if hot-standby → config-set + config-write on standby
+    step_4b: if not hot-standby → skip standby, return 207 with warning
+    step_5: config-reload on active node
+    step_6: config-reload on standby (only if step_4a succeeded)
+
+# =========================================================
+# HA STATE GUARD RULES
+# =========================================================
+
+ha_state_guard:
+  hot-standby:
+    standby_apply: true
+    description: Normal operation. Standby is passive and safe to configure.
+
+  communication-recovery:
+    standby_apply: false
+    description: >
+      Temporary connectivity issue between peers.
+      Applying config-set to standby during this state risks split-brain.
+      Skip standby apply and return 207.
+
+  partner-down:
+    standby_apply: false
+    description: >
+      A peer has been declared permanently down.
+      The node in partner-down is serving all clients alone.
+      Do not attempt config-set on the other node.
+
+  syncing:
+    standby_apply: false
+    description: Lease database sync in progress. Do not interrupt.
+
+  waiting:
+    standby_apply: false
+    description: Node is starting up and waiting for partner.
+
+  ready:
+    standby_apply: false
+    description: Node synced, waiting for partner to confirm.
 
 # =========================================================
 # DOCKER RULES
@@ -107,19 +181,31 @@ docker_rules:
       - cap_add: NET_RAW
       - cap_add: NET_ADMIN
     port_mappings:
-      - "8000:8000"   # Kea Control Agent → host
+      - "8001:8001"
+      - "8002:8002"
 
   services:
-    - name: kea-dhcp4
+    - name: kea-primary
       image: "jonasal/kea-dhcp4:2"
-      config: "config/kea-dhcp4.conf"
-    - name: kea-control-agent
+      config: "config/kea-primary.conf"
+
+    - name: kea-primary-ctrl-agent
       image: "jonasal/kea-ctrl-agent:2"
-      config: "config/kea-ctrl-agent.conf"
+      config: "config/kea-ctrl-agent-primary.conf"
+
+    - name: kea-standby
+      image: "jonasal/kea-dhcp4:2"
+      config: "config/kea-standby.conf"
+
+    - name: kea-standby-ctrl-agent
+      image: "jonasal/kea-ctrl-agent:2"
+      config: "config/kea-ctrl-agent-standby.conf"
 
   volumes:
-    - kea-socket   # shared unix socket between kea-dhcp4 and kea-control-agent
-    - kea-leases   # memfile lease storage
+    - kea-primary-socket
+    - kea-standby-socket
+    - kea-primary-leases
+    - kea-standby-leases
 
   restart_policy: "unless-stopped"
 
@@ -129,68 +215,81 @@ docker_rules:
 
 backend_rules:
   package_structure:
-    - cmd/app/           # main: CLI flag parsing, command dispatch, HTTP server setup
+    - cmd/app/           # main: CLI flags, command dispatch, HTTP server
     - internal/kea/      # Kea Control Agent HTTP client + models
     - internal/api/      # HTTP handlers (chi router)
     - internal/service/  # DHCPService: validation + business logic
-    - pkg/config/        # App configuration (URL, timeout)
+    - internal/ha/       # HAManager: state polling, active node selection, guarded apply
+    - pkg/config/        # App config (primary URL, standby URL, timeout)
 
   forbidden_packages:
-    - internal/ha/       # Must not exist
-    - internal/snmp/     # Must not exist
-    - internal/lldp/     # Must not exist
+    - internal/snmp/
+    - internal/lldp/
 
-  responsibilities:
-    - Manage DHCP configuration via Kea Control Agent API
-    - Validate subnets and pools before applying
-    - Expose REST API for subnet CRUD and reload
-    - Report Kea reachability and lease stats
+  ha_manager_contract:
+    - Status(ctx) ClusterStatus         — ha-heartbeat on both nodes
+    - ActiveClient(ctx) *kea.Client     — primary preferred; standby only if partner-down
+    - GuardedApply(ctx, fn) ApplyResult — apply fn to active, check HA state, apply to standby if safe
+
+  apply_result_type: >
+    ApplyResult {
+      PrimaryOK  bool
+      StandbyOK  bool
+      HAState    string   // state observed after primary apply
+      Warning    string   // non-empty when standby was skipped
+    }
 
   forbidden:
-    - Any HA or failover logic
-    - SNMP polling
-    - LLDP collection
+    - Caching config state between requests
+    - Custom election or failover logic
+    - Custom lease sync logic
+    - SNMP / LLDP
     - Lease file manipulation
     - DHCP packet crafting
     - Global mutable state
-    - fmt.Println in production paths (use log/slog)
+    - fmt.Println in production paths
 
   api_endpoints_required:
     - path: "GET /health"
-      behavior: >
-        Calls config-get (or a lightweight ping) on Control Agent.
-        Returns {"status":"ok","kea":{"reachable":true}} on success.
-        Returns HTTP 503 if Kea is unreachable.
+      response_200: >
+        {"status":"ok","kea":{"primary":{"reachable":true},"standby":{"reachable":true}}}
+      response_503: primary unreachable
 
     - path: "GET /config"
-      behavior: "Returns full Kea config JSON from config-get"
+      behavior: config-get on active node
 
     - path: "POST /kea/reload"
-      behavior: "Calls config-write then config-reload. Alias: POST /reload"
+      behavior: full reload_policy sequence; alias POST /reload
 
     - path: "GET /stats"
-      behavior: >
-        Calls statistic-get on Kea dhcp4 service.
-        Returns flat JSON of lease counters (total, assigned, declined).
+      behavior: statistic-get-all on active node
 
     - path: "GET /subnets"
-      behavior: "Lists subnet4 from current Kea config"
+      behavior: config-get subnets on active node
 
     - path: "POST /subnets"
-      behavior: >
-        Validates subnet CIDR and pool ranges, then calls config-set + config-write.
-        Supports optional reservations array.
+      behavior: validate → guarded apply
+      response_201: both nodes updated
+      response_207: active updated, standby skipped (body contains warning + ha_state)
 
     - path: "DELETE /subnets/{id}"
-      behavior: "Removes subnet by ID via config-set + config-write"
+      behavior: guarded apply
+      response_204: both nodes updated
+      response_207: active updated, standby skipped
+
+    - path: "GET /ha/status"
+      behavior: ha-heartbeat on both nodes
+      response: >
+        {"primary":{"state":"hot-standby","role":"primary","reachable":true},
+         "standby":{"state":"hot-standby","role":"standby","reachable":true}}
 
   design_constraints:
-    - Use context.Context everywhere; pass it through all layers
+    - context.Context everywhere
     - No global mutable state
-    - Structured logging only (log/slog); level from LOG_LEVEL env var
-    - Graceful shutdown on SIGTERM / SIGINT (http.Server.Shutdown)
-    - Request timeout configurable via -timeout flag
-    - config-write must always follow config-set (reload_policy)
+    - log/slog only; LOG_LEVEL env var; default info
+    - Graceful shutdown on SIGTERM/SIGINT
+    - -kea-primary-url and -kea-standby-url flags
+    - -timeout flag
 
 # =========================================================
 # TESTING RULES
@@ -199,15 +298,21 @@ backend_rules:
 testing_rules:
   approach: "unit tests with mocks — no live Kea required"
   required:
-    - DHCPService.ValidateSubnet: valid CIDR, invalid CIDR, IPv6 rejection
-    - DHCPService.ValidatePool: valid range, reversed range, out-of-subnet range
-    - DHCPService.AddSubnet: calls client with correct Subnet4 struct
-    - API handler /health: returns 200 when client reachable, 503 when not
-    - API handler POST /subnets: returns 400 on missing subnet field
-    - kea.Client response parsing: single-object response, array response, error result
+    - ValidateSubnet: valid CIDR, invalid CIDR, IPv6 rejection
+    - ValidatePool: valid range, reversed range, out-of-subnet range
+    - DHCPService.AddSubnet: calls GuardedApply with correct Subnet4
+    - HAManager.Status: both reachable; primary down; standby down
+    - HAManager.ActiveClient: primary in hot-standby; standby in partner-down; both down → error
+    - HAManager.GuardedApply: hot-standby → applies to both; returns PrimaryOK+StandbyOK
+    - HAManager.GuardedApply: communication-recovery → applies to active only; returns Warning
+    - HAManager.GuardedApply: standby unreachable → StandbyOK false, Warning set, no error
+    - API GET /health: 200 both reachable; 503 primary down
+    - API POST /subnets: 400 missing subnet; 201 both OK; 207 standby skipped
+    - API GET /ha/status: correct JSON shape
+    - kea.Client HAHeartbeat: parses state; handles result != 0; handles network error
   expectations:
-    - go test ./... must pass with no external dependencies
-    - No Docker, no network, no file system access in unit tests
+    - go test ./... passes with no external dependencies
+    - No Docker, network, or filesystem access in unit tests
 
 # =========================================================
 # OBSERVABILITY RULES
@@ -215,33 +320,37 @@ testing_rules:
 
 observability_rules:
   logging:
-    - Use log/slog exclusively — never fmt.Println or log.Printf in handlers
-    - Log level from LOG_LEVEL env var (debug / info / warn / error); default info
-    - Log every config mutation: add subnet, delete subnet, reload
-    - Log all errors with context (operation name, error message)
-    - Do not log sensitive data (credentials, full request bodies)
+    - log/slog only
+    - LOG_LEVEL env var (debug/info/warn/error); default info
+    - Log every config mutation: operation, target node, outcome
+    - Log when standby apply is skipped: include observed HA state
+    - Log HA state transitions
+    - Log errors with context: operation, node, error message
+    - Do not log credentials or full request bodies
 
 # =========================================================
 # SECURITY RULES
 # =========================================================
 
 security_rules:
-  - Control Agent port 8000 must only be exposed to localhost or internal network
-  - No hardcoded credentials anywhere in source code
-  - Internal Kea unix socket must not be mounted outside its containers
+  - Ports 8001/8002 must only be exposed to localhost or internal network
+  - No hardcoded credentials
+  - Unix sockets must not be mounted outside their containers
 
 # =========================================================
 # NON-GOALS
 # =========================================================
 
 non_goals:
-  - active_standby_ha
   - active_active_ha
-  - failover_or_election_logic
+  - custom_election_logic          # Kea HA state machine handles this
+  - custom_lease_sync              # libdhcp_ha.so handles this
+  - in_memory_canonical_config     # Kea is source of truth
+  - config_file_as_canonical       # Kea is source of truth
   - snmp_integration
   - lldp_integration
   - lease_database_backend
   - host_network_mode
   - custom_dhcp_implementation
   - direct_lease_file_access
----
+  - load_balancing_mode

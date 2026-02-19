@@ -1,34 +1,63 @@
 services:
-  kea-dhcp4:
+  kea-primary:
     image: jonasal/kea-dhcp4:2
-    container_name: kea-dhcp4
+    container_name: kea-primary
     volumes:
       - ./config:/kea/config
-      - kea-socket:/kea/sockets
-      - kea-leases:/kea/leases
+      - kea-primary-socket:/kea/sockets
+      - kea-primary-leases:/kea/leases
     networks:
       - kea-network
     restart: unless-stopped
-    command: -c /kea/config/kea-dhcp4.conf
+    command: -c /kea/config/kea-primary.conf
 
-  kea-control-agent:
+  kea-primary-ctrl-agent:
     image: jonasal/kea-ctrl-agent:2
-    container_name: kea-control-agent
+    container_name: kea-primary-ctrl-agent
     volumes:
       - ./config:/kea/config
-      - kea-socket:/kea/sockets
+      - kea-primary-socket:/kea/sockets
     networks:
       - kea-network
     ports:
-      - "8000:8000"
+      - "8001:8001"
     restart: unless-stopped
-    command: -c /kea/config/kea-ctrl-agent.conf
+    command: -c /kea/config/kea-ctrl-agent-primary.conf
     depends_on:
-      - kea-dhcp4
+      - kea-primary
+
+  kea-standby:
+    image: jonasal/kea-dhcp4:2
+    container_name: kea-standby
+    volumes:
+      - ./config:/kea/config
+      - kea-standby-socket:/kea/sockets
+      - kea-standby-leases:/kea/leases
+    networks:
+      - kea-network
+    restart: unless-stopped
+    command: -c /kea/config/kea-standby.conf
+
+  kea-standby-ctrl-agent:
+    image: jonasal/kea-ctrl-agent:2
+    container_name: kea-standby-ctrl-agent
+    volumes:
+      - ./config:/kea/config
+      - kea-standby-socket:/kea/sockets
+    networks:
+      - kea-network
+    ports:
+      - "8002:8002"
+    restart: unless-stopped
+    command: -c /kea/config/kea-ctrl-agent-standby.conf
+    depends_on:
+      - kea-standby
 
 volumes:
-  kea-socket:
-  kea-leases:
+  kea-primary-socket:
+  kea-standby-socket:
+  kea-primary-leases:
+  kea-standby-leases:
 
 networks:
   kea-network:

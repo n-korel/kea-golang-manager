@@ -1,19 +1,23 @@
 # kea-golang-manager
 
-Go-менеджер для [Kea DHCP](https://kea.readthedocs.io/) через REST API Control Agent. Поддерживает CLI и HTTP API.
+Go-менеджер для [Kea DHCP](https://kea.readthedocs.io/) через REST API Control Agent.  
+Поддерживает **Active-Standby HA** (hot-standby), CLI и HTTP API.
 
-Kea — единственный DHCP-движок. Go не реализует протокол DHCP и не манипулирует lease-файлами напрямую.
+Kea — единственный DHCP-движок и единственный источник конфигурации.  
+Go не реализует протокол DHCP, выборы узлов, failover и не манипулирует lease-файлами.
 
 ---
 
 ## Содержание
 
 - [Архитектура](#архитектура)
+- [Ключевые архитектурные решения](#ключевые-архитектурные-решения)
 - [Требования](#требования)
 - [Быстрый старт](#быстрый-старт)
 - [Конфигурация](#конфигурация)
 - [API](#api)
 - [CLI](#cli)
+- [HA: статус и поведение](#ha-статус-и-поведение)
 - [Тестирование](#тестирование)
 - [Makefile](#makefile)
 
@@ -22,27 +26,29 @@ Kea — единственный DHCP-движок. Go не реализует �
 ## Архитектура
 
 ```
-┌──────────────────────────────────────────┐
-│           Docker Compose (bridge)        │
-│                                          │
-│  ┌─────────────────────┐                 │
-│  │      kea-dhcp4      │  UDP :67        │
-│  │  lease: memfile     │                 │
-│  └──────────┬──────────┘                 │
-│             │ unix socket                │
-│  ┌──────────▼──────────┐                 │
-│  │  kea-control-agent  │  HTTP :8000     │
-│  └──────────┬──────────┘                 │
-└─────────────┼────────────────────────────┘
-              │ HTTP
-┌─────────────▼────────────────────────────┐
-│         kea-golang-manager  :8080        │
-│                                          │
-│  GET  /health        GET  /stats         │
-│  GET  /config        GET  /subnets       │
-│  POST /kea/reload    POST /subnets       │
-│                      DELETE /subnets/:id │
-└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│               Docker Compose (bridge)                │
+│                                                      │
+│  ┌─────────────────────┐  ┌─────────────────────┐    │
+│  │    kea-primary      │  │    kea-standby      │    │
+│  │  lease: memfile     │◄─►  lease: memfile     │    │
+│  │  role: primary      │  │  role: standby      │    │
+│  └──────────┬──────────┘  └──────────┬──────────┘    │
+│      unix socket                unix socket          │
+│  ┌──────────▼──────────┐  ┌──────────▼──────────┐    │
+│  │  kea-ctrl-agent     │  │  kea-ctrl-agent     │    │
+│  │  primary  :8001     │  │  standby  :8002     │    │
+│  └──────────┬──────────┘  └──────────┬──────────┘    │
+└─────────────┼────────────────────────┼───────────────┘
+              │ HTTP                   │ HTTP
+┌─────────────▼────────────────────────▼───────────────┐
+│           kea-golang-manager  :8080                  │
+│                                                      │
+│  GET  /health        GET  /stats                     │
+│  GET  /config        GET  /subnets                   │
+│  POST /kea/reload    POST /subnets                   │
+│  GET  /ha/status     DELETE /subnets/:id             │
+└──────────────────────────────────────────────────────┘
 ```
 
 ### Стек
@@ -50,7 +56,9 @@ Kea — единственный DHCP-движок. Go не реализует �
 | Слой | Технология |
 |---|---|
 | DHCP-сервер | Kea DHCP 2.x |
-| Lease backend | memfile (БД не используется) |
+| HA | hot-standby (Kea built-in) |
+| Lease sync | libdhcp_ha.so + libdhcp_lease_cmds.so |
+| Lease backend | memfile |
 | Backend | Go 1.22, chi/v5 |
 | Deployment | Docker Compose (bridge) |
 
@@ -62,13 +70,58 @@ kea-golang-manager/
 ├── internal/
 │   ├── api/               # HTTP-обработчики (chi)
 │   ├── kea/               # Клиент Kea Control Agent
+│   ├── ha/                # HAManager: статус, выбор узла, guarded apply
 │   └── service/           # Бизнес-логика (DHCPService)
-├── pkg/config/            # Конфигурация приложения
-├── config/                # Конфиги Kea (kea-dhcp4.conf, kea-ctrl-agent.conf)
+├── pkg/config/            # Конфигурация (primary URL, standby URL, timeout)
+├── config/
+│   ├── kea-primary.conf
+│   ├── kea-standby.conf
+│   ├── kea-ctrl-agent-primary.conf
+│   └── kea-ctrl-agent-standby.conf
 ├── docker-compose.yml
 ├── Makefile
 └── README.md
 ```
+
+---
+
+## Ключевые архитектурные решения
+
+### Kea как единственный источник конфигурации
+
+Менеджер не хранит конфигурацию ни в памяти, ни в файле на диске. Каждый запрос на чтение (`GET /config`, `GET /subnets`) идёт напрямую в Kea через `config-get`. Kea сохраняет конфиг на диск самостоятельно через `config-write`.
+
+**Последствие:** если конфиг Kea был изменён вне менеджера (вручную или другим клиентом), менеджер об этом не знает и не обнаружит рассинхронизацию.
+
+### Стратегия применения конфига: Guarded Apply
+
+`libdhcp_ha.so` синхронизирует **лизы**, но не конфигурацию. Если применить конфиг только на primary, а primary упадёт — standby поднимется с устаревшей конфигурацией и не будет знать о новых подсетях.
+
+Поэтому все мутации применяются по следующему алгоритму:
+
+```
+1. config-set + config-write на активном узле
+2. ha-heartbeat → проверить HA-состояние
+3a. Если hot-standby → config-set + config-write на standby
+3b. Если не hot-standby → пропустить standby, вернуть HTTP 207 с предупреждением
+4. config-reload на активном узле
+5. config-reload на standby (только если шаг 3a выполнен)
+```
+
+Применение конфига на standby в состоянии `hot-standby` **безопасно**: standby пассивен и config-set не влияет на lease state machine. Применение в состоянии `communication-recovery` или `partner-down` **пропускается** для предотвращения split-brain.
+
+### HTTP 207 — частичный успех
+
+Если standby apply был пропущен, API возвращает `207 Multi-Status` вместо `201`/`204`:
+
+```json
+{
+  "warning": "standby apply skipped",
+  "ha_state": "communication-recovery"
+}
+```
+
+Это не ошибка — операция на активном узле выполнена успешно. Предупреждение информирует, что конфиги узлов временно расходятся.
 
 ---
 
@@ -81,20 +134,20 @@ kea-golang-manager/
 
 ## Быстрый старт
 
-### 1. Запустить Kea
+### 1. Запустить Kea HA-кластер
 
 ```bash
 docker compose up -d
 ```
 
-Проверить статус:
-
 ```bash
 docker compose ps
-docker compose logs kea-control-agent
+docker compose logs kea-primary-ctrl-agent
+docker compose logs kea-standby-ctrl-agent
 ```
 
-Control Agent доступен на `http://localhost:8000`.
+Control Agent primary: `http://localhost:8001`  
+Control Agent standby: `http://localhost:8002`
 
 ### 2. Собрать менеджер
 
@@ -105,19 +158,27 @@ make build
 ### 3. Запустить HTTP-сервер
 
 ```bash
-./bin/kea-manager serve-http
+./bin/kea-manager serve-http \
+  -kea-primary-url=http://localhost:8001 \
+  -kea-standby-url=http://localhost:8002
 ```
 
-### 4. Проверить здоровье
+### 4. Проверить кластер
 
 ```bash
+# Здоровье
 curl -s http://localhost:8080/health | jq
+
+# HA-статус
+curl -s http://localhost:8080/ha/status | jq
 ```
+
+Ожидаемый ответ после полного старта:
 
 ```json
 {
-  "status": "ok",
-  "kea": { "reachable": true }
+  "primary": { "state": "hot-standby", "role": "primary", "reachable": true },
+  "standby": { "state": "hot-standby", "role": "standby", "reachable": true }
 }
 ```
 
@@ -129,71 +190,88 @@ curl -s http://localhost:8080/health | jq
 
 | Флаг | По умолчанию | Описание |
 |---|---|---|
-| `-kea-url` | `http://localhost:8000` | URL Kea Control Agent |
+| `-kea-primary-url` | `http://localhost:8001` | URL primary Control Agent |
+| `-kea-standby-url` | `http://localhost:8002` | URL standby Control Agent |
 | `-timeout` | `10s` | Таймаут HTTP-запросов к Kea |
 | `-http-addr` | `:8080` | Адрес HTTP-сервера |
 
-### Kea DHCP конфигурация
+### HA-конфигурация в Kea
 
-Файл `config/kea-dhcp4.conf`. Ключевые параметры:
+Оба файла (`kea-primary.conf`, `kea-standby.conf`) должны содержать hooks:
 
 ```json
 {
-  "Dhcp4": {
-    "interfaces-config": { "interfaces": ["eth0"] },
-    "lease-database": {
-      "type": "memfile",
-      "name": "/kea/leases/kea-dhcp4.leases"
-    },
-    "control-socket": {
-      "socket-type": "unix",
-      "socket-name": "/kea/sockets/kea-dhcp4-ctrl.sock"
-    },
-    "subnet4": [
-      {
-        "id": 1,
-        "subnet": "192.168.1.0/24",
-        "pools": [{ "pool": "192.168.1.10-192.168.1.200" }]
+  "hooks-libraries": [
+    { "library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so" },
+    {
+      "library": "/usr/lib/kea/hooks/libdhcp_ha.so",
+      "parameters": {
+        "high-availability": [{
+          "this-server-name": "kea-primary",
+          "mode": "hot-standby",
+          "heartbeat-delay": 10000,
+          "max-response-delay": 30000,
+          "max-ack-delay": 5000,
+          "max-unacked-clients": 5,
+          "peers": [
+            {
+              "name": "kea-primary",
+              "url": "http://kea-primary-ctrl-agent:8001",
+              "role": "primary",
+              "auto-failover": true
+            },
+            {
+              "name": "kea-standby",
+              "url": "http://kea-standby-ctrl-agent:8002",
+              "role": "standby",
+              "auto-failover": true
+            }
+          ]
+        }]
       }
-    ]
-  }
+    }
+  ]
 }
 ```
 
-> Все изменения конфигурации через API автоматически сохраняются на диск (`config-write`) и применяются без перезапуска (`config-reload`).
+В `kea-standby.conf` меняется только `this-server-name: "kea-standby"`.
 
 ---
 
 ## API
 
-Все эндпоинты доступны на `http://localhost:8080`.
+Все эндпоинты на `http://localhost:8080`.
 
-### Здоровье
-
-#### `GET /health`
-
-```bash
-curl -s http://localhost:8080/health | jq
-```
+### `GET /health`
 
 ```json
 {
   "status": "ok",
-  "kea": { "reachable": true }
+  "kea": {
+    "primary": { "reachable": true },
+    "standby": { "reachable": true }
+  }
 }
 ```
 
-Коды: `200` (ok), `503` (Kea недоступен).
+`200` — OK, `503` — primary недоступен.
 
-### Статистика
+### `GET /ha/status`
 
-#### `GET /stats`
-
-Lease-статистика напрямую от Kea (команда `statistic-get-all`).
-
-```bash
-curl -s http://localhost:8080/stats | jq
+```json
+{
+  "primary": { "state": "hot-standby", "role": "primary", "reachable": true },
+  "standby": { "state": "hot-standby", "role": "standby", "reachable": true }
+}
 ```
+
+Возможные значения `state`: `hot-standby`, `partner-down`, `communication-recovery`, `syncing`, `waiting`, `ready`.
+
+### `GET /config`
+
+Конфигурация активного узла (`config-get`).
+
+### `GET /stats`
 
 ```json
 {
@@ -203,35 +281,11 @@ curl -s http://localhost:8080/stats | jq
 }
 ```
 
-### Конфигурация Kea
+### `GET /subnets`
 
-#### `GET /config`
+Список подсетей с активного узла.
 
-Получить текущую конфигурацию Kea.
-
-```bash
-curl -s http://localhost:8080/config | jq
-```
-
-#### `POST /kea/reload`
-
-Сохранить конфигурацию на диск (`config-write`) и перезагрузить (`config-reload`).
-
-```bash
-curl -X POST http://localhost:8080/kea/reload
-```
-
-> Алиас: `POST /reload` — работает так же.
-
-### Подсети
-
-#### `GET /subnets`
-
-```bash
-curl -s http://localhost:8080/subnets | jq
-```
-
-#### `POST /subnets`
+### `POST /subnets`
 
 ```bash
 curl -X POST http://localhost:8080/subnets \
@@ -240,86 +294,92 @@ curl -X POST http://localhost:8080/subnets \
     "subnet": "192.168.2.0/24",
     "pools": ["192.168.2.10-192.168.2.200"],
     "reservations": [
-      {
-        "hw-address": "aa:bb:cc:dd:ee:ff",
-        "ip-address": "192.168.2.50",
-        "hostname": "server1"
-      }
+      { "hw-address": "aa:bb:cc:dd:ee:ff", "ip-address": "192.168.2.50", "hostname": "server1" }
     ]
   }'
 ```
 
-#### `DELETE /subnets/{id}`
+- `201` — применено на оба узла
+- `207` — применено только на активный (standby пропущен, см. тело ответа)
+- `400` — ошибка валидации
 
-```bash
-curl -X DELETE http://localhost:8080/subnets/2
-```
+### `DELETE /subnets/{id}`
+
+- `204` — удалено на обоих
+- `207` — удалено только на активном
+
+### `POST /kea/reload`
+
+Полная последовательность reload (6 шагов). Алиас: `POST /reload`.
 
 ---
 
 ## CLI
 
 ```
-./bin/kea-manager [глобальные флаги] <команда> [флаги команды]
+./bin/kea-manager [флаги] <команда>
 ```
-
-### Глобальные флаги
-
-| Флаг | По умолчанию | Описание |
-|---|---|---|
-| `-kea-url` | `http://localhost:8000` | URL Kea Control Agent |
-| `-timeout` | `10s` | Таймаут HTTP-запросов |
-| `-http-addr` | `:8080` | Адрес для `serve-http` |
-
-### Команды
 
 | Команда | Описание |
 |---|---|
 | `serve-http` | Запустить HTTP API-сервер |
-| `show-config` | Вывести текущую конфигурацию Kea (JSON) |
-| `add-subnet` | Добавить подсеть с пулами и резервациями |
-| `reload` | Сохранить и перезагрузить конфигурацию Kea |
-
-### Примеры
-
-```bash
-# Запуск сервера
-./bin/kea-manager serve-http -http-addr=:8080
-
-# Показать конфигурацию
-./bin/kea-manager show-config
-
-# Добавить подсеть
-./bin/kea-manager add-subnet \
-  -subnet=192.168.10.0/24 \
-  -pools=192.168.10.10-192.168.10.200
-
-# Добавить подсеть с резервацией
-./bin/kea-manager add-subnet \
-  -subnet=192.168.10.0/24 \
-  -pools=192.168.10.10-192.168.10.200 \
-  -hw-address=aa:bb:cc:dd:ee:ff \
-  -ip-address=192.168.10.50 \
-  -hostname=server1
-
-# Сохранить и перезагрузить конфигурацию
-./bin/kea-manager reload
-```
+| `show-config` | Конфигурация активного узла (JSON) |
+| `add-subnet` | Добавить подсеть (guarded apply) |
+| `reload` | Сохранить и перезагрузить конфигурацию |
+| `ha-status` | HA-статус обоих узлов |
 
 ---
 
-## Прямые запросы к Kea Control Agent
+## HA: статус и поведение
 
-Для отладки напрямую на порту 8000:
+### Что делает менеджер
+
+- Опрашивает `ha-heartbeat` на обоих узлах
+- Выбирает активный узел для чтения и записи
+- Применяет guarded apply при мутациях конфига
+- Логирует смену HA-состояний и причины пропуска standby
+
+### Что делает Kea (без участия менеджера)
+
+- Обнаруживает недоступность партнёра через heartbeat
+- Автоматически переключается в `partner-down`
+- Синхронизирует лизы при восстановлении партнёра
+- Возвращается в `hot-standby` после sync
+
+### HA-состояния и поведение Guarded Apply
+
+| Состояние | Standby apply | Причина |
+|---|---|---|
+| `hot-standby` | ✅ выполняется | Standby пассивен, безопасно |
+| `communication-recovery` | ⚠️ пропускается | Риск split-brain |
+| `partner-down` | ⚠️ пропускается | Партнёр недоступен или изолирован |
+| `syncing` | ⚠️ пропускается | Идёт sync lease DB |
+| `waiting` | ⚠️ пропускается | Узел стартует |
+| `ready` | ⚠️ пропускается | Ожидание подтверждения от партнёра |
+
+При пропуске возвращается `HTTP 207` с полем `ha_state`.
+
+---
+
+## Тестирование
 
 ```bash
-# Получить конфигурацию
-curl -X POST http://localhost:8000 \
-  -H "Content-Type: application/json" \
-  -d '{"command":"config-get","service":["dhcp4"]}' | jq
+make test
+```
 
-# Перезагрузить конфигурацию
-curl -X POST http://localhost:8000 \
-  -H "Content-Type: application/json" \
-  -d '{"command":"config-reload","service":["dhcp4"]}'
+Тесты без Docker и без живого Kea (только моки).
+
+---
+
+## Makefile
+
+```
+make build       — собрать бинарник
+make run         — go run
+make test        — unit-тесты
+make clean       — удалить bin/
+make docker-up   — поднять Kea HA-кластер
+make docker-down — остановить кластер
+make docker-logs — логи контейнеров
+make smoke       — smoke-test против запущенного сервера
 ```
