@@ -236,6 +236,10 @@ curl -s http://localhost:8080/ha/status | jq
 
 В `kea-standby.conf` меняется только `this-server-name: "kea-standby"`.
 
+**Docker (образы jonasal):**  
+- Путь к хукам: `/usr/local/lib/kea/hooks` (в конфигах проекта уже указан).  
+- URL пиров HA: хук `libdhcp_ha.so` в этом образе принимает только IP-адреса. В конфигах указаны имена сервисов (`kea-primary-ctrl-agent`, `kea-standby-ctrl-agent`); при старте контейнеров скрипт `scripts/kea-dhcp-entrypoint.sh` подставляет их IP в копию конфига, чтобы избежать статических IP в Docker (и ошибки «Address already in use» в VMware и др.).
+
 ---
 
 ## API
@@ -358,6 +362,26 @@ curl -X POST http://localhost:8080/subnets \
 | `ready` | ⚠️ пропускается | Ожидание подтверждения от партнёра |
 
 При пропуске возвращается `HTTP 207` с полем `ha_state`.
+
+---
+
+## Устранение неполадок
+
+### «Address already in use» при `docker compose up`
+
+В VMware (и в некоторых средах) кастомная подсеть Docker может конфликтовать с сетью хоста. В проекте статические IP не используются: скрипт `scripts/kea-dhcp-entrypoint.sh` при старте подставляет IP ctrl-agent в конфиг. Убедитесь, что скрипт исполняемый: `chmod +x scripts/kea-dhcp-entrypoint.sh`.
+
+### Файл `/etc/docker/daemon.json`
+
+Файла может не быть — его можно создать. Например, отключить IPv6 (иногда помогает при сетевых ошибках в VMware):
+
+```bash
+sudo mkdir -p /etc/docker
+echo '{"ipv6": false}' | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
+```
+
+После изменений снова выполните `docker compose up -d`.
 
 ---
 

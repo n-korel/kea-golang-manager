@@ -1,16 +1,4 @@
 services:
-  kea-primary:
-    image: jonasal/kea-dhcp4:2
-    container_name: kea-primary
-    volumes:
-      - ./config:/kea/config
-      - kea-primary-socket:/kea/sockets
-      - kea-primary-leases:/kea/leases
-    networks:
-      - kea-network
-    restart: unless-stopped
-    command: -c /kea/config/kea-primary.conf
-
   kea-primary-ctrl-agent:
     image: jonasal/kea-ctrl-agent:2
     container_name: kea-primary-ctrl-agent
@@ -21,22 +9,24 @@ services:
       - kea-network
     ports:
       - "8001:8001"
+      - "8003:8003"
     restart: unless-stopped
     command: -c /kea/config/kea-ctrl-agent-primary.conf
-    depends_on:
-      - kea-primary
 
-  kea-standby:
+  kea-primary:
     image: jonasal/kea-dhcp4:2
-    container_name: kea-standby
+    container_name: kea-primary
+    network_mode: "service:kea-primary-ctrl-agent"
     volumes:
       - ./config:/kea/config
-      - kea-standby-socket:/kea/sockets
-      - kea-standby-leases:/kea/leases
-    networks:
-      - kea-network
+      - ./scripts/kea-dhcp-entrypoint.sh:/entrypoint-kea.sh:ro
+      - kea-primary-socket:/kea/sockets
+      - kea-primary-leases:/kea/leases
     restart: unless-stopped
-    command: -c /kea/config/kea-standby.conf
+    entrypoint: ["sh", "/entrypoint-kea.sh"]
+    command: ["kea-primary.conf"]
+    depends_on:
+      - kea-primary-ctrl-agent
 
   kea-standby-ctrl-agent:
     image: jonasal/kea-ctrl-agent:2
@@ -48,10 +38,24 @@ services:
       - kea-network
     ports:
       - "8002:8002"
+      - "8004:8004"
     restart: unless-stopped
     command: -c /kea/config/kea-ctrl-agent-standby.conf
+
+  kea-standby:
+    image: jonasal/kea-dhcp4:2
+    container_name: kea-standby
+    network_mode: "service:kea-standby-ctrl-agent"
+    volumes:
+      - ./config:/kea/config
+      - ./scripts/kea-dhcp-entrypoint.sh:/entrypoint-kea.sh:ro
+      - kea-standby-socket:/kea/sockets
+      - kea-standby-leases:/kea/leases
+    restart: unless-stopped
+    entrypoint: ["sh", "/entrypoint-kea.sh"]
+    command: ["kea-standby.conf"]
     depends_on:
-      - kea-standby
+      - kea-standby-ctrl-agent
 
 volumes:
   kea-primary-socket:
